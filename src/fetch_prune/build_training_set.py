@@ -643,7 +643,7 @@ def _fetch_daily_weather(lat, lon, start, end, tz="America/New_York"):
     w["FlightDate"] = pd.to_datetime(w["time"])
     return w.drop(columns=["time"])
 
-def _get_weather_for_airports_daily(df, coords_map, tz_default="America/New_York", cache_dir="data/weather_cache"):
+def _get_weather_for_airports_daily(df, coords_map, tz_default="America/New_York", cache_dir="../../data/weather_cache"):
     Path(cache_dir).mkdir(parents=True, exist_ok=True)
     start = df["FlightDate"].min().strftime("%Y-%m-%d")
     end   = df["FlightDate"].max().strftime("%Y-%m-%d")
@@ -1186,8 +1186,8 @@ def main():
     df = apply_delay_reason_filters(df, cfg)
 
     # ---------- Time zones & local times ----------
-    airport_json_raw = cfg.get("airport_json", "data/airport_coords.json")
-    airport_json = str(_resolve_path(airport_json_raw))
+    airport_json_raw = cfg.get("airport_json", "../../data/airport_coords.json")
+    airport_json = "../../data/airport_coords.json"
     print(f"[INFO] airport_json -> {airport_json}  (exists={Path(airport_json).exists()})")
 
     # pre-check CRS time NAs
@@ -1255,7 +1255,7 @@ def main():
     df = downsample_rows(df, cfg)
 
     # ---------- Output ----------
-    out_path_cfg = cfg.get("output_parquet", "src/data/processed/train_ready.parquet")
+    out_path_cfg = cfg.get("output_parquet", "../../data/processed/train_ready.parquet")
     out_path = _resolve_output_path(out_path_cfg)
     out_path.parent.mkdir(parents=True, exist_ok=True)
     df.to_parquet(out_path, index=False)
