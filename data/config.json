@@ -1,0 +1,73 @@
+{
+  "input_flights_path": [
+    "data/raw_bts/Year=2023/Month=01/flights.parquet",
+    "data/raw_bts/Year=2023/Month=02/flights.parquet",
+    "data/raw_bts/Year=2023/Month=03/flights.parquet",
+    "data/raw_bts/Year=2023/Month=04/flights.parquet",
+    "data/raw_bts/Year=2023/Month=05/flights.parquet",
+    "data/raw_bts/Year=2023/Month=06/flights.parquet",
+    "data/raw_bts/Year=2023/Month=07/flights.parquet",
+    "data/raw_bts/Year=2023/Month=08/flights.parquet",
+    "data/raw_bts/Year=2023/Month=09/flights.parquet",
+    "data/raw_bts/Year=2023/Month=10/flights.parquet",
+    "data/raw_bts/Year=2023/Month=11/flights.parquet",
+    "data/raw_bts/Year=2023/Month=12/flights.parquet",
+    "data/raw_bts/Year=2024/Month=01/flights.parquet",
+    "data/raw_bts/Year=2024/Month=02/flights.parquet",
+    "data/raw_bts/Year=2024/Month=03/flights.parquet",
+    "data/raw_bts/Year=2024/Month=04/flights.parquet",
+    "data/raw_bts/Year=2024/Month=05/flights.parquet",
+    "data/raw_bts/Year=2024/Month=06/flights.parquet",
+    "data/raw_bts/Year=2024/Month=07/flights.parquet",
+    "data/raw_bts/Year=2024/Month=08/flights.parquet",
+    "data/raw_bts/Year=2024/Month=09/flights.parquet",
+    "data/raw_bts/Year=2024/Month=10/flights.parquet",
+    "data/raw_bts/Year=2024/Month=11/flights.parquet",
+    "data/raw_bts/Year=2024/Month=12/flights.parquet"
+  ],
+  "output_training_path": "data/processed/train_ready.parquet",
+  "airports": ["JFK", "LAX", "ATL", "BWI", "OAK","JAX","BMX","DFW","ORD","MCO","CLT","PHX","LAS","MIA","DEN","TPA","MSP","IAH","DCA","PDX","BNA","PVD","LGA","BOS","SEA","IND","EWR","SAN","PHL"],
+  "airlines": ["AA"],
+  "start_date": "2023-01-01",
+  "end_date": "2024-12-30",
+
+  "balance_on_time_delayed": false,
+  "sample_max_rows": 200000,
+  "sample_strategy": "stratified_by_label",
+  "sample_seed": 42,
+
+  "exclude_delay_reasons": ["late_aircraft","security"],
+
+  "tight_turn_min": 40,
+  "taxi_window_days": 7,
+  "taxi_bin_minutes": 30,
+  "add_aircraft_age": true,
+
+  "add_weather": true,
+  "add_hourly_weather": true,
+  "add_hourly_precip_window": true,
+  "airport_json": "src/data/airport_coords.json",
+  "_weather_timezone": "",
+  "weather_cache_dir": "data/weather_cache",
+
+  "aircraft_registry_csv": "data/aircraft_registry_clean.csv",
+  "weather_code_only": true,
+
+  "first_flight_of_day_only": false,
+  "carrier_baseline_days": 7,
+  "od_baseline_days": 7,
+  "flightnum_baseline_days": 14,
+  "origin_baseline_days": 7,
+  "dest_baseline_days": 7,
+  "delay_threshold_minutes": 15,
+  "filter_weather_delay_only": false,
+  "weather_code_threshold": 3,
+  "filter_weather_mode": "positives_only",
+   "lagged_dest_wx": {
+    "code_prev_hours": 2,
+    "precip_prev_hours": 3,
+    "wind_prev_hours": 3,
+    "since_wx_gt3_lookback_hours": 6
+  }
+
+}
