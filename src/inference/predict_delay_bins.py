@@ -1,364 +1,176 @@
-# predict_delay_bins.py
-
-
-#python predict_delay_bins.py \
-#  --model_dir ../../models/ordinal \
-#  --input ../../data/processed/train_ready.parquet \
-#  --output ../../data/predictions/delay_bins.parquet \
-#  --output_csv ../../data/predictions/delay_bins_head.csv \
-#  --inbound_priors ../../models/priors/inbound_priors.parquet \
-#  --hours_back 2 \
-#  --min_support 50 \
-#  --explain
-
-import sys
-import json
-import argparse
+# src/inference/predict_delay_bins.py
+import sys, json
 from pathlib import Path
 import numpy as np
 import pandas as pd
+import joblib
+from catboost import CatBoostClassifier, Pool
 
-from catboost import CatBoostClassifier
-from joblib import load as joblib_load
+# Same feature lists as training
+CATS_CAND = [
+    "Origin", "Dest", "Reporting_Airline", "OD_pair",
+    "Aircraft_Age_Bucket",
+    "origin_weathercode", "dest_weathercode",
+    "origin_dep_weathercode", "dest_arr_weathercode",
+]
+NUMS_CAND = [
+    "dep_count_origin_bin", "arr_count_dest_trail_2h", "carrier_flights_prior_day",
+    "origin_taxiout_avg_7d_bin", "dest_taxiin_avg_7d_bin",
+    "origin_taxiout_avg_14d_bin", "dest_taxiin_avg_14d_bin",
+    "origin_taxiout_avg_28d_bin", "dest_taxiin_avg_28d_bin",
+    "carrier_delay_7d_mean", "od_delay_7d_mean", "flightnum_delay_14d_mean",
+    "origin_delay_7d_mean", "dest_delay_7d_mean",
+    "origin_temperature_2m_max", "origin_temperature_2m_min", "origin_precipitation_sum",
+    "origin_windspeed_10m_max", "origin_windgusts_10m_max",
+    "dest_temperature_2m_max", "dest_temperature_2m_min", "dest_precipitation_sum",
+    "dest_windspeed_10m_max", "dest_windgusts_10m_max",
+    "origin_dep_temperature_2m", "origin_dep_windspeed_10m", "origin_dep_windgusts_10m", "origin_dep_precipitation",
+    "dest_arr_temperature_2m", "dest_arr_windspeed_10m", "dest_arr_windgusts_10m", "dest_arr_precipitation",
+    "dest_arr_wx_max_code_prev_2h", "dest_arr_wx_any_gt3_prev_2h",
+    "dest_arr_precip_sum_prev_3h", "dest_arr_wind_max_prev_3h", "dest_arr_gust_max_prev_3h",
+]
 
-# Silence the deprecation by using isinstance with CategoricalDtype
-from pandas.api.types import CategoricalDtype as _CatDtype
+THRESHOLDS = [15, 30, 45, 60]
 
-BIN_EDGES = [0, 15, 30, 45, 60, 10**9]
-BIN_LABELS = ["0-14", "15-29", "30-44", "45-59", "60+"]
 
-def _load_registry(model_dir: Path):
-    reg_path = model_dir / "registry.json"
-    with open(reg_path, "r") as f:
-        reg = json.load(f)
-    # figure feature list from any CatBoost model
-    any_thr = sorted(reg.keys(), key=lambda x: int(x))[0]
-    model_path = Path(reg[any_thr]["model_path"])
-    cb = CatBoostClassifier()
-    cb.load_model(str(model_path))
-    feature_names = cb.feature_names_
-    print(f"[INFO] Feature count (from CatBoost): {len(feature_names)}")
-    # load all calibrated wrappers
-    cals = {}
-    for thr in sorted(reg.keys(), key=lambda x: int(x)):
-        cal_path = Path(reg[thr]["cal_path"])
-        cal = joblib_load(cal_path)
-        print(f"[INFO] Loaded calibrated ≥{thr} model: {cal_path}")
-        cals[int(thr)] = cal
-    return feature_names, cals
+def as_str(series):
+    s = series.astype("object").fillna("Unknown")
+    return s.map(
+        lambda v: "Unknown" if pd.isna(v) else str(int(v)) if isinstance(v, float) and v.is_integer() else str(v))
 
-def _prep_frame(df: pd.DataFrame, feature_names):
-    X = df.copy()
-    # Make sure categorical-looking columns are strings
-    for colname in feature_names:
-        if colname not in X.columns:
-            X[colname] = np.nan
-    X = X[feature_names]
-    for c in X.columns:
-        col = X[c]
-        dt = col.dtype
-        if str(dt) in ("object", "string") or isinstance(dt, _CatDtype):
-            X[c] = col.fillna("Unknown").astype(str)
+
+def load_registry(models_root):
+    with open(models_root / "registry.json", "r") as f:
+        return json.load(f)
+
+
+def prep_features(df):
+    # Ensure OD_pair
+    if "OD_pair" not in df.columns and {"Origin", "Dest"}.issubset(df.columns):
+        df["OD_pair"] = df["Origin"].astype(str).str.upper() + "_" + df["Dest"].astype(str).str.upper()
+
+    cat_feats = [c for c in CATS_CAND if c in df.columns]
+    num_feats = [c for c in NUMS_CAND if c in df.columns]
+    X = df[cat_feats + num_feats].copy()
+    for c in cat_feats:
+        X[c] = as_str(X[c])
+    for c in num_feats:
+        X[c] = pd.to_numeric(X[c], errors="coerce")
+        if X[c].isna().any():
+            X[c] = X[c].fillna(X[c].median())
+    return X, cat_feats, num_feats
+
+
+def explain_top_reasons(model: CatBoostClassifier, X_row: pd.DataFrame, cat_feats, num_feats, top_k=3):
+    # SHAP-like per-feature contributions from CatBoost
+    pool = Pool(X_row, cat_features=[X_row.columns.get_loc(c) for c in cat_feats])
+    contribs = model.get_feature_importance(type="PredictionValuesChange", data=pool)
+    # contribs is array shape (n_features,)
+    pairs = list(zip(X_row.columns, contribs))
+    # sort by absolute contribution descending
+    top = sorted(pairs, key=lambda t: abs(t[1]), reverse=True)[:top_k]
+
+    # Map to short phrases
+    phrases = []
+    for name, val in top:
+        direction = "higher risk" if val > 0 else "lower risk"
+        if "weathercode" in name:
+            phrases.append(f"{name.replace('_', ' ')} → {direction}")
+        elif "wind" in name or "gust" in name:
+            phrases.append(f"{name.replace('_', ' ')} → {direction}")
+        elif "precip" in name:
+            phrases.append(f"{name.replace('_', ' ')} → {direction}")
+        elif "delay_" in name:
+            phrases.append(f"recent delay baseline ({name}) → {direction}")
+        elif "taxi" in name:
+            phrases.append(f"taxi congestion ({name}) → {direction}")
+        elif name in ("Origin", "Dest", "OD_pair"):
+            phrases.append(f"route {X_row[name].iloc[0]} → {direction}")
         else:
-            X[c] = pd.to_numeric(col, errors="coerce")
-    return X
+            phrases.append(f"{name} → {direction}")
+    return phrases
 
-# ---------- inbound priors helpers ----------
-
-class InboundPriors:
-    def __init__(self, df: pd.DataFrame):
-        # Expect columns: Reporting_Airline, Dest, Month, DOW, arr_hour_local,
-        # p_ge15,p_ge30,p_ge45,p_ge60, sample_size
-        self.df = df.copy()
-        self._mk_indexes()
-
-    def _mk_indexes(self):
-        self.df["Reporting_Airline"] = self.df["Reporting_Airline"].astype(str)
-        self.df["Dest"] = self.df["Dest"].astype(str)
-        self.df["Month"] = self.df["Month"].astype(int)
-        self.df["DOW"] = self.df["DOW"].astype(int)
-        self.df["arr_hour_local"] = self.df["arr_hour_local"].astype(int)
-
-        self.idx_cols = ["Reporting_Airline","Dest","Month","DOW","arr_hour_local"]
-        self.df.set_index(self.idx_cols, inplace=True, drop=False)
-
-        # Backoffs
-        self.df_lvl1 = self.df.reset_index(drop=True).set_index(["Reporting_Airline","Dest","Month","DOW"], drop=False)
-        self.df_lvl2 = self.df.reset_index(drop=True).set_index(["Reporting_Airline","Dest","Month"], drop=False)
-        self.df_lvl3 = self.df.reset_index(drop=True).set_index(["Reporting_Airline","Dest"], drop=False)
-
-    def _lookup_hour(self, key5):
-        try:
-            return self.df.loc[key5]
-        except KeyError:
-            return None
-
-    def _avg_two_hours(self, keys5):
-        # average probabilities and sum sample_size across available hours
-        rows = [self._lookup_hour(k) for k in keys5]
-        rows = [r for r in rows if r is not None]
-        if not rows:
-            return None
-        cat = pd.concat(rows, axis=1).T  # small
-        out = {}
-        for c in ["p_ge15","p_ge30","p_ge45","p_ge60"]:
-            out[c] = float(cat[c].mean())
-        out["sample_size"] = int(cat["sample_size"].sum())
-        return out
-
-    def get_tail_probs(self, carrier, dest, month, dow, dep_hour, hours_back=2, min_support=50):
-        # arrivals into 'dest' in the prior hours_back hours:
-        hours = [int((dep_hour - h) % 24) for h in range(1, hours_back+1)]
-        keys5 = [(carrier, dest, int(month), int(dow), h) for h in hours]
-        out = self._avg_two_hours(keys5)
-        level_used = "HOUR"
-
-        # Backoffs if missing
-        if out is None:
-            # mean over all hours for (C,Dest,Month,DOW)
-            try:
-                rows = self.df_lvl1.loc[(carrier, dest, int(month), int(dow))]
-                if isinstance(rows, pd.DataFrame):
-                    cat = rows
-                else:
-                    cat = rows.to_frame().T
-                out = {c: float(cat[c].mean()) for c in ["p_ge15","p_ge30","p_ge45","p_ge60"]}
-                out["sample_size"] = int(cat["sample_size"].sum())
-                level_used = "LVL1"
-            except KeyError:
-                pass
-        if out is None:
-            try:
-                rows = self.df_lvl2.loc[(carrier, dest, int(month))]
-                if isinstance(rows, pd.DataFrame):
-                    cat = rows
-                else:
-                    cat = rows.to_frame().T
-                out = {c: float(cat[c].mean()) for c in ["p_ge15","p_ge30","p_ge45","p_ge60"]}
-                out["sample_size"] = int(cat["sample_size"].sum())
-                level_used = "LVL2"
-            except KeyError:
-                pass
-        if out is None:
-            try:
-                rows = self.df_lvl3.loc[(carrier, dest)]
-                if isinstance(rows, pd.DataFrame):
-                    cat = rows
-                else:
-                    cat = rows.to_frame().T
-                out = {c: float(cat[c].mean()) for c in ["p_ge15","p_ge30","p_ge45","p_ge60"]}
-                out["sample_size"] = int(cat["sample_size"].sum())
-                level_used = "LVL3"
-            except KeyError:
-                pass
-
-        if out is None:
-            # final fallback: zero inbound pressure
-            out = {c: 0.0 for c in ["p_ge15","p_ge30","p_ge45","p_ge60"]}
-            out["sample_size"] = 0
-            level_used = "NONE"
-
-        out["level_used"] = level_used
-        out["low_support"] = bool(out["sample_size"] < int(min_support))
-        return out
-
-def _combine_ordinals(local, inbound):
-    # Combine tail probs independently at each threshold
-    comb = {}
-    for thr_key in ["p_ge15","p_ge30","p_ge45","p_ge60"]:
-        pL = float(local[thr_key])
-        pI = float(inbound[thr_key])
-        comb[thr_key] = 1.0 - (1.0 - pL) * (1.0 - pI)
-    # Convert to disjoint bin probs
-    p0_14 = 1.0 - comb["p_ge15"]
-    p15_29 = comb["p_ge15"] - comb["p_ge30"]
-    p30_44 = comb["p_ge30"] - comb["p_ge45"]
-    p45_59 = comb["p_ge45"] - comb["p_ge60"]
-    p60p   = comb["p_ge60"]
-    # Guard numerical drift
-    probs = np.maximum(0.0, np.array([p0_14,p15_29,p30_44,p45_59,p60p]))
-    probs = probs / probs.sum() if probs.sum() > 0 else probs
-    return {
-        "p_on_time_0_14": probs[0],
-        "p_15_29": probs[1],
-        "p_30_44": probs[2],
-        "p_45_59": probs[3],
-        "p_60_plus": probs[4],
-        # keep tails too
-        "p_ge15": comb["p_ge15"],
-        "p_ge30": comb["p_ge30"],
-        "p_ge45": comb["p_ge45"],
-        "p_ge60": comb["p_ge60"],
-    }
-
-def _most_likely_bin_row(row):
-    probs = [row["p_on_time_0_14"], row["p_15_29"], row["p_30_44"], row["p_45_59"], row["p_60_plus"]]
-    return BIN_LABELS[int(np.argmax(probs))]
-
-def _exp_from_probs(row):
-    # crude expected delay using bin midpoints (8,22,37,52,75)
-    mids = np.array([8,22,37,52,75], dtype=float)
-    probs = np.array([row["p_on_time_0_14"], row["p_15_29"], row["p_30_44"], row["p_45_59"], row["p_60_plus"]], dtype=float)
-    return float(np.dot(mids, probs))
 
 def main():
-    ap = argparse.ArgumentParser()
-    ap.add_argument("--model_dir", required=True)
-    ap.add_argument("--input", required=True)
-    ap.add_argument("--output", required=True)
-    ap.add_argument("--output_csv", default=None)
-    ap.add_argument("--explain", action="store_true")
-    # NEW: inbound priors
-    ap.add_argument("--inbound_priors", default=None, help="Parquet from build_inbound_priors.py")
-    ap.add_argument("--hours_back", type=int, default=2, help="How many prior hours to average (default 2)")
-    ap.add_argument("--min_support", type=int, default=50, help="Low-support threshold for priors")
-    args = ap.parse_args()
+    if len(sys.argv) != 3:
+        print("Usage: python predict_delay_bins.py path/to/models/ordinal path/to/flights_to_score.parquet")
+        sys.exit(1)
 
-    model_dir = Path(args.model_dir)
-    feature_names, calibrated = _load_registry(model_dir)
+    MODELS_ROOT = Path(sys.argv[1])
+    INPUT = Path(sys.argv[2])
 
-    # Load input
-    in_path = Path(args.input)
-    df = pd.read_parquet(in_path)
+    registry = load_registry(MODELS_ROOT)
+    df = pd.read_parquet(INPUT)
+    X, cat_feats, num_feats = prep_features(df)
 
-    # Make sure we have keys for priors: Month, DOW, dep_hour_local, Origin
-    df["FlightDate"] = pd.to_datetime(df["FlightDate"], errors="coerce")
-    df["Month"] = df["FlightDate"].dt.month.astype("Int64")
-    df["DOW"] = df["FlightDate"].dt.dayofweek.astype("Int64")  # 0..6
+    # Load calibrated estimators
+    calibrators = {}
+    raw_models = {}
+    for thr in THRESHOLDS:
+        info = registry[str(thr)]
+        cal = joblib.load(info["cal_path"])
+        calibrators[thr] = cal
+        # Load raw model for explanations
+        m = CatBoostClassifier()
+        m.load_model(info["model_path"])
+        raw_models[thr] = m
 
-    # dep hour local: prefer existing; else derive from CRSDepTime
-    if "dep_hour_local" in df.columns and df["dep_hour_local"].notna().any():
-        dep_hour = df["dep_hour_local"].astype("Int64")
-    else:
-        def hhmm_to_hour(x):
-            try:
-                s = str(int(x)).zfill(4)
-                return int(s[:2])
-            except Exception:
-                return np.nan
-        dep_hour = df["CRSDepTime"].apply(hhmm_to_hour).astype("Int64")
-    df["dep_hour_local"] = dep_hour
+    # Predict probabilities P(delay >= thr)
+    proba = {}
+    for thr in THRESHOLDS:
+        p = calibrators[thr].predict_proba(X)[:, 1]
+        # Clip to [0,1] and enforce weak monotonicity in post (optional)
+        proba[thr] = np.clip(p, 0, 1)
 
-    # Prepare features and local calibrated tail probs
-    X = _prep_frame(df, feature_names)
-    local = {}
-    for thr, cal in calibrated.items():
-        p = cal.predict_proba(X)[:, 1]
-        local[thr] = p
-    # Pack local tails as a frame for combination
-    local_df = pd.DataFrame({
-        "pL_ge15": local.get(15, np.zeros(len(df))),
-        "pL_ge30": local.get(30, np.zeros(len(df))),
-        "pL_ge45": local.get(45, np.zeros(len(df))),
-        "pL_ge60": local.get(60, np.zeros(len(df))),
-    })
+    out = pd.DataFrame(index=df.index)
+    out["p_ge_15"] = proba[15]
+    out["p_ge_30"] = proba[30]
+    out["p_ge_45"] = proba[45]
+    out["p_ge_60"] = proba[60]
+    # On-time = 1 - p_ge_15
+    out["p_on_time"] = 1.0 - out["p_ge_15"]
 
-    # Optional inbound priors
-    pri = None
-    if args.inbound_priors:
-        pri_df = pd.read_parquet(args.inbound_priors)
-        pri = InboundPriors(pri_df)
+    # (Optional) enforce monotone: p_ge_60 <= p_ge_45 <= p_ge_30 <= p_ge_15
+    out[["p_ge_60", "p_ge_45", "p_ge_30", "p_ge_15"]] = (
+        out[["p_ge_60", "p_ge_45", "p_ge_30", "p_ge_15"]].cummax(axis=1).iloc[:, ::-1]
+    )
 
-    # Combine per row
-    out_rows = []
-    low_support_flags = []
-    inbound_levels = []
-    pI_cols = {"pI_ge15": [], "pI_ge30": [], "pI_ge45": [], "pI_ge60": []}
+    # Format user-facing bins (percentages)
+    out["on_time_pct"] = (100 * out["p_on_time"]).round(1)
+    out["ge15_pct"] = (100 * out["p_ge_15"]).round(1)
+    out["ge30_pct"] = (100 * out["p_ge_30"]).round(1)
+    out["ge45_pct"] = (100 * out["p_ge_45"]).round(1)
+    out["ge60_pct"] = (100 * out["p_ge_60"]).round(1)
 
-    for i, r in df.iterrows():
-        # Local tails
-        loc = {
-            "p_ge15": float(local_df.at[i, "pL_ge15"]),
-            "p_ge30": float(local_df.at[i, "pL_ge30"]),
-            "p_ge45": float(local_df.at[i, "pL_ge45"]),
-            "p_ge60": float(local_df.at[i, "pL_ge60"]),
-        }
+    # Simple “why”: from the ≥15 model’s local feature contributions
+    whys = []
+    thr15_model = raw_models[15]
+    for i in range(len(X)):
+        row = X.iloc[[i]]
+        phrases = explain_top_reasons(thr15_model, row, cat_feats, num_feats, top_k=3)
+        whys.append("; ".join(phrases))
+    out["why_short"] = whys
 
-        # Inbound tails (arrivals into ORIGIN station before this departure)
-        if pri is not None:
-            carrier = str(r["Reporting_Airline"])
-            dest_station = str(r["Origin"])
-            month = int(r["Month"]) if pd.notna(r["Month"]) else 1
-            dow   = int(r["DOW"]) if pd.notna(r["DOW"]) else 0
-            dep_h = int(r["dep_hour_local"]) if pd.notna(r["dep_hour_local"]) else 0
+    # Attach key identifiers for display
+    keys = [c for c in
+            ["FlightDate", "Reporting_Airline", "Flight_Number_Reporting_Airline", "Origin", "Dest", "CRSDepTime"] if
+            c in df.columns]
+    result = pd.concat([df[keys], out[["on_time_pct", "ge15_pct", "ge30_pct", "ge45_pct", "ge60_pct", "why_short"]]],
+                       axis=1)
 
-            inbound = pri.get_tail_probs(
-                carrier=carrier,
-                dest=dest_station,
-                month=month,
-                dow=dow,
-                dep_hour=dep_h,
-                hours_back=args.hours_back,
-                min_support=args.min_support
-            )
-            pI = {
-                "p_ge15": inbound["p_ge15"],
-                "p_ge30": inbound["p_ge30"],
-                "p_ge45": inbound["p_ge45"],
-                "p_ge60": inbound["p_ge60"],
-            }
-            low_support_flags.append(inbound["low_support"])
-            inbound_levels.append(inbound["level_used"])
-            for k,v in zip(["pI_ge15","pI_ge30","pI_ge45","pI_ge60"], [pI["p_ge15"],pI["p_ge30"],pI["p_ge45"],pI["p_ge60"]]):
-                pI_cols[k].append(v)
-        else:
-            pI = {k: 0.0 for k in ["p_ge15","p_ge30","p_ge45","p_ge60"]}
-            low_support_flags.append(False)
-            inbound_levels.append("OFF")
-            for k in ["pI_ge15","pI_ge30","pI_ge45","pI_ge60"]:
-                pI_cols[k].append(0.0)
+    # Save
+    OUT = MODELS_ROOT / "predictions_with_bins.parquet"
+    result.to_parquet(OUT, index=False)
+    print(f"[OK] wrote {OUT}")
+    # Example row print
+    if len(result) > 0:
+        r0 = result.iloc[0]
+        print("\nExample:")
+        print(f"On-time (0–14m): {r0.on_time_pct:.1f}%")
+        print(
+            f"≥15m: {r0.ge15_pct:.1f}%  | ≥30m: {r0.ge30_pct:.1f}%  | ≥45m: {r0.ge45_pct:.1f}%  | ≥60m: {r0.ge60_pct:.1f}%")
+        print(f"Why: {r0.why_short}")
 
-        comb = _combine_ordinals(loc, pI)
-        out_rows.append(comb)
-
-    prob_df = pd.DataFrame(out_rows, index=df.index)
-    for k, vals in pI_cols.items():
-        prob_df[k] = vals
-    prob_df["inbound_low_support"] = low_support_flags
-    prob_df["inbound_level_used"] = inbound_levels
-
-    # Most likely bin + expected minutes
-    prob_df["most_likely_bin"] = prob_df.apply(_most_likely_bin_row, axis=1)
-    prob_df["delay_minutes_expected"] = prob_df.apply(_exp_from_probs, axis=1)
-
-    # Build 'why'
-    why_msgs = []
-    if args.explain:
-        for i, r in df.iterrows():
-            msgs = []
-            # Basic drivers you already used in earlier version:
-            # (Keep it simple here; you can reuse your richer logic.)
-            if float(prob_df.at[i, "pI_ge15"]) > 0.2:
-                msgs.append("inbound propagation risk elevated")
-            else:
-                msgs.append("inbound propagation risk low")
-            if prob_df.at[i, "inbound_low_support"]:
-                msgs.append("low historical support for inbound priors")
-            why_msgs.append("; ".join(msgs))
-    else:
-        why_msgs = [""] * len(df)
-    prob_df["why"] = why_msgs
-
-    # Select output columns similar to your earlier CSV
-    keep_cols = [
-        "FlightDate","Reporting_Airline","Flight_Number_Reporting_Airline","Origin","Dest",
-        "p_on_time_0_14","p_15_29","p_30_44","p_45_59","p_60_plus",
-        "most_likely_bin","delay_minutes_expected","why",
-        "p_ge15","p_ge30","p_ge45","p_ge60",
-        "pI_ge15","pI_ge30","pI_ge45","pI_ge60",
-        "inbound_low_support","inbound_level_used"
-    ]
-    out = pd.concat([df, prob_df], axis=1)
-    out_path = Path(args.output)
-    out_path.parent.mkdir(parents=True, exist_ok=True)
-    out[keep_cols].to_parquet(out_path, index=False)
-    print(f"[OK] wrote {out_path} rows={len(out)}")
-
-    if args.output_csv:
-        csv_path = Path(args.output_csv)
-        out[keep_cols].head(200).to_csv(csv_path, index=False)
-        print(f"[OK] wrote head CSV {csv_path}")
 
 if __name__ == "__main__":
     main()
-

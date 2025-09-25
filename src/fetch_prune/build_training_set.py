@@ -1255,7 +1255,7 @@ def main():
     df = downsample_rows(df, cfg)
 
     # ---------- Output ----------
-    out_path_cfg = cfg.get("output_parquet", "../../data/processed/train_ready.parquet")
+    out_path_cfg = cfg.get("output_training_path", "../../data/processed/train_ready.parquet")
     out_path = _resolve_output_path(out_path_cfg)
     out_path.parent.mkdir(parents=True, exist_ok=True)
     df.to_parquet(out_path, index=False)
