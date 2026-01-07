@@ -1,5 +1,9 @@
 # src/training/train_ordinal_delay_risks.py
-import sys, json
+
+"""
+ python3.9 src/training/train_ordinal_delay_risks.py --outdir models/ordinal --prefix UA_ data/processed/UA_top50_23-24_weekout.parquet
+"""
+import sys, json, time, argparse
 from pathlib import Path
 import numpy as np
 import pandas as pd
@@ -7,7 +11,6 @@ import pandas as pd
 from sklearn.model_selection import train_test_split
 from sklearn.calibration import CalibratedClassifierCV
 from sklearn.metrics import roc_auc_score, roc_curve
-from sklearn.utils import shuffle
 import joblib
 
 from catboost import CatBoostClassifier, Pool
@@ -23,6 +26,10 @@ def best_threshold_youden(y_true, y_proba):
     j = tpr - fpr
     i = int(np.argmax(j))
     return float(thr[i]), float(tpr[i]), float(fpr[i])
+
+def _with_prefix(prefix: str, name: str) -> str:
+    """Return '<prefix>_<name>' if prefix provided, else 'name'."""
+    return f"{prefix}_{name}" if prefix else name
 
 # Candidate features (same idea as your binary script; keep intersection)
 CATS_CAND = [
@@ -59,14 +66,26 @@ def make_labels(df, thr):
         d = pd.to_numeric(df["ArrDelay"], errors="coerce").fillna(0)
     return (d >= thr).astype(int)
 
-def main():
-    if len(sys.argv) != 2:
-        print("Usage: python train_ordinal_delay_risks.py path/to/train_ready.parquet")
-        sys.exit(1)
+def parse_args():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("train_ready", type=str, help="Path to train_ready.parquet")
+    ap.add_argument("--outdir", type=str, default=None,
+                    help="Output dir for models (default: <repo>/models/ordinal)")
+    ap.add_argument("--prefix", type=str, default="",
+                    help="Optional filename prefix for saved artifacts (e.g., 'aa_week1'). "
+                         "Filenames become '<prefix>_catboost_thrXX.cbm', etc.")
+    return ap.parse_args()
 
-    INPUT = Path(sys.argv[1])
-    OUTDIR = Path(__file__).resolve().parents[2] / "models" / "ordinal"
+def main():
+    args = parse_args()
+    INPUT = Path(args.train_ready)
+    OUTDIR = Path(args.outdir) if args.outdir else Path(__file__).resolve().parents[2] / "models" / "ordinal"
     OUTDIR.mkdir(parents=True, exist_ok=True)
+    prefix = args.prefix.strip()
+
+    print(f"[INFO] train_ready={INPUT}")
+    print(f"[INFO] outdir={OUTDIR}")
+    print(f"[INFO] prefix={'<none>' if not prefix else prefix}")
 
     df = pd.read_parquet(INPUT)
 
@@ -115,7 +134,10 @@ def main():
 
     # Train one calibrated model per threshold
     registry = {}
+    created_at = time.strftime("%Y-%m-%d %H:%M:%S")
+
     for thr in THRESHOLDS:
+        print(f"\n[INFO] === Training threshold ≥{thr} ===")
         y = make_labels(df, thr)
         y_train = y[idx_train]
         y_val   = y[idx_val]
@@ -143,38 +165,50 @@ def main():
         calibrator.fit(X_val, y_val)
 
         # Eval
-        val_proba = calibrator.predict_proba(X_val)[:, 1]
+        val_proba  = calibrator.predict_proba(X_val)[:, 1]
         test_proba = calibrator.predict_proba(X_test)[:, 1]
-        auc_val = roc_auc_score(y_val, val_proba)
+        auc_val  = roc_auc_score(y_val,  val_proba)
         auc_test = roc_auc_score(y_test, test_proba)
         print(f"[thr>={thr:02d}] AUC val={auc_val:.3f} test={auc_test:.3f}")
 
         # Save
         thr_dir = OUTDIR / f"thr_{thr}"
         thr_dir.mkdir(parents=True, exist_ok=True)
-        clf.save_model(str(thr_dir / f"catboost_thr{thr}.cbm"))
-        joblib.dump(calibrator, thr_dir / f"calibrated_thr{thr}.joblib")
+
+        model_fname = _with_prefix(prefix, f"catboost_thr{thr}.cbm")
+        cal_fname   = _with_prefix(prefix, f"calibrated_thr{thr}.joblib")
+        meta_fname  = _with_prefix(prefix, f"meta_thr{thr}.json")
+
+        clf.save_model(str(thr_dir / model_fname))
+        joblib.dump(calibrator, thr_dir / cal_fname)
 
         # Keep feature names (for inference/explanations)
-        with open(thr_dir / "meta.json", "w") as f:
-            json.dump({
-                "threshold": thr,
-                "categorical_features": cat_feats,
-                "numeric_features": num_feats,
-                "input_parquet": str(INPUT),
-                "val_auc": auc_val,
-                "test_auc": auc_test
-            }, f, indent=2)
+        meta = {
+            "threshold": thr,
+            "categorical_features": cat_feats,
+            "numeric_features": num_feats,
+            "input_parquet": str(INPUT),
+            "val_auc": auc_val,
+            "test_auc": auc_test,
+            "created_at": created_at,
+            "prefix": prefix
+        }
+        with open(thr_dir / meta_fname, "w") as f:
+            json.dump(meta, f, indent=2)
 
         registry[thr] = {
-            "model_path": str(thr_dir / f"catboost_thr{thr}.cbm"),
-            "cal_path": str(thr_dir / f"calibrated_thr{thr}.joblib"),
+            "model_path": str(thr_dir / model_fname),
+            "cal_path": str(thr_dir / cal_fname),
+            "prefix": prefix,
+            "thr_dir": str(thr_dir),
         }
 
     with open(OUTDIR / "registry.json", "w") as f:
         json.dump(registry, f, indent=2)
 
     print("\n[OK] Trained & saved ordinal risk models at:", OUTDIR)
+    if prefix:
+        print(f"[OK] Artifact filenames are prefixed with '{prefix}_'")
 
 if __name__ == "__main__":
     main()

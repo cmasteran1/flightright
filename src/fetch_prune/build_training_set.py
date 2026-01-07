@@ -1186,8 +1186,8 @@ def main():
     df = apply_delay_reason_filters(df, cfg)
 
     # ---------- Time zones & local times ----------
-    airport_json_raw = cfg.get("airport_json", "../../data/airport_coords.json")
-    airport_json = "../../data/airport_coords.json"
+    airport_json_raw = cfg.get("airport_json", "data/airport_coords.json")
+    airport_json = "data/airport_coords.json"
     print(f"[INFO] airport_json -> {airport_json}  (exists={Path(airport_json).exists()})")
 
     # pre-check CRS time NAs
@@ -1255,7 +1255,7 @@ def main():
     df = downsample_rows(df, cfg)
 
     # ---------- Output ----------
-    out_path_cfg = cfg.get("output_training_path", "../../data/processed/train_ready.parquet")
+    out_path_cfg = cfg.get("output_training_path", "data/processed/train_ready.parquet")
     out_path = _resolve_output_path(out_path_cfg)
     out_path.parent.mkdir(parents=True, exist_ok=True)
     df.to_parquet(out_path, index=False)
