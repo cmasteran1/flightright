@@ -1,0 +1,36 @@
+# Duplicate to providers.toml and/or use environment variables.
+# Any env var overrides the values here.
+
+# Flight data providers (pick 1+)
+[AeroDataBox]
+API_KEY = ""         # e.g., "adb_xxx"
+
+[AviationStack]
+API_KEY = ""
+
+[AirLabs]
+API_KEY = ""
+
+[OpenSky]  # no key, but you can set auth if you have it
+USERNAME = ""
+PASSWORD = ""
+
+# Weather forecast providers
+[TomorrowIO]
+API_KEY = ""
+
+[VisualCrossing]
+API_KEY = ""
+
+# NWS/NOAA doesn't use keys but REQUIRES a User-Agent that identifies you.
+[NWS]
+USER_AGENT = "your_email@example.com (your_project_name)"
+
+# Optional: RapidAPI (if you go that route for certain datasets)
+[RapidAPI]
+API_KEY = ""
+
+# Optional: rate limits / defaults (non-secret)
+[Defaults]
+REQUEST_TIMEOUT_SEC = 30
+RETRY_MAX = 3
