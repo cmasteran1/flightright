@@ -34,26 +34,26 @@ def _with_prefix(prefix: str, name: str) -> str:
 # Candidate features (same idea as your binary script; keep intersection)
 CATS_CAND = [
     "Origin","Dest","Reporting_Airline","OD_pair",
-    "Aircraft_Age_Bucket",
+    #"Aircraft_Age_Bucket",
     "origin_weathercode","dest_weathercode",
     "origin_dep_weathercode","dest_arr_weathercode",
 ]
 NUMS_CAND = [
-    "dep_count_origin_bin","arr_count_dest_trail_2h","carrier_flights_prior_day",
-    "origin_taxiout_avg_7d_bin","dest_taxiin_avg_7d_bin",
-    "origin_taxiout_avg_14d_bin","dest_taxiin_avg_14d_bin",
-    "origin_taxiout_avg_28d_bin","dest_taxiin_avg_28d_bin",
-    "carrier_delay_7d_mean","od_delay_7d_mean","flightnum_delay_14d_mean",
-    "origin_delay_7d_mean","dest_delay_7d_mean",
+    #"dep_count_origin_bin","arr_count_dest_trail_2h","carrier_flights_prior_day",
+    #"origin_taxiout_avg_7d_bin","dest_taxiin_avg_7d_bin",
+    #"origin_taxiout_avg_14d_bin","dest_taxiin_avg_14d_bin",
+    #"origin_taxiout_avg_28d_bin","dest_taxiin_avg_28d_bin",
+    #"carrier_delay_7d_mean","od_delay_7d_mean","flightnum_delay_14d_mean",
+    #"origin_delay_7d_mean","dest_delay_7d_mean",
     "origin_temperature_2m_max","origin_temperature_2m_min","origin_precipitation_sum",
     "origin_windspeed_10m_max","origin_windgusts_10m_max",
     "dest_temperature_2m_max","dest_temperature_2m_min","dest_precipitation_sum",
     "dest_windspeed_10m_max","dest_windgusts_10m_max",
-    "origin_dep_temperature_2m","origin_dep_windspeed_10m","origin_dep_windgusts_10m","origin_dep_precipitation",
-    "dest_arr_temperature_2m","dest_arr_windspeed_10m","dest_arr_windgusts_10m","dest_arr_precipitation",
+    #"origin_dep_temperature_2m","origin_dep_windspeed_10m","origin_dep_windgusts_10m","origin_dep_precipitation",
+    #"dest_arr_temperature_2m","dest_arr_windspeed_10m","dest_arr_windgusts_10m","dest_arr_precipitation",
     # optional lagged dest wx features if you added them:
-    "dest_arr_wx_max_code_prev_2h","dest_arr_wx_any_gt3_prev_2h",
-    "dest_arr_precip_sum_prev_3h","dest_arr_wind_max_prev_3h","dest_arr_gust_max_prev_3h",
+    #"dest_arr_wx_max_code_prev_2h","dest_arr_wx_any_gt3_prev_2h",
+    #"dest_arr_precip_sum_prev_3h","dest_arr_wind_max_prev_3h","dest_arr_gust_max_prev_3h",
 ]
 
 THRESHOLDS = [15, 30, 45, 60]  # minutes
@@ -177,7 +177,7 @@ def main():
 
         model_fname = _with_prefix(prefix, f"catboost_thr{thr}.cbm")
         cal_fname   = _with_prefix(prefix, f"calibrated_thr{thr}.joblib")
-        meta_fname  = _with_prefix(prefix, f"meta_thr{thr}.json")
+        meta_fname  = "meta.json"
 
         clf.save_model(str(thr_dir / model_fname))
         joblib.dump(calibrator, thr_dir / cal_fname)
