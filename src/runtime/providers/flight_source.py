@@ -24,108 +24,65 @@ Usage:
     print(info)
 """
 
+# src/runtime/providers/flight_source.py
 from __future__ import annotations
-from dataclasses import dataclass, field
-from pathlib import Path
-from typing import Optional, Dict, Any, List
+from typing import Optional, List, Dict, Any
+from dataclasses import dataclass
 
-# Import providers with exact names/paths in your tree
-from .schedules.aerodatabox import AeroDataBoxProvider  # type: ignore
-from .openskydata import OpenSkyProvider  # type: ignore
-
+from .schedules.aerodatabox import AeroDataBoxProvider
+from .schedules.base import PlannedFlight, ScheduleProvider
+from .openskydata import OpenSkyData  # may not provide planned schedule
 
 @dataclass
 class FlightInfoSource:
     """
-    prefer_order: which providers to try (first success wins).
-                  Supported names: "aerodatabox", "opensky"
-    iata_icao_map: optional path to IATA→ICAO CSV (used by OpenSky provider)
+    Facade over multiple schedule sources.
+    prefer_order: list like ["aerodatabox","opensky"].
     """
-    prefer_order: List[str] = field(default_factory=lambda: ["aerodatabox", "opensky"])
-    iata_icao_map: Optional[str] = None
+    prefer_order: Optional[List[str]] = None
 
-    def _provider(self, name: str):
-        name = name.lower().strip()
-        if name == "aerodatabox":
-            return AeroDataBoxProvider()
-        if name == "opensky":
-            kwargs = {}
-            if self.iata_icao_map:
-                kwargs["iata_icao_map_path"] = Path(self.iata_icao_map)
-            return OpenSkyProvider(**kwargs)
-        raise ValueError(f"Unknown provider: {name}")
+    def __post_init__(self):
+        order = (self.prefer_order or ["aerodatabox", "opensky"])
+        self.providers: Dict[str, ScheduleProvider] = {}
 
-    # --- planned (future) flight schedule ---
+        for key in order:
+            key_l = key.lower().strip()
+            if key_l == "aerodatabox":
+                self.providers[key_l] = AeroDataBoxProvider()
+            elif key_l == "opensky":
+                # OpenSky doesn’t support planned schedules reliably; keep for other ops.
+                self.providers[key_l] = OpenSkyData()
+            # silently ignore unknown strings to keep it simple
+
+        self.order = [k for k in order if k.lower() in self.providers]
+
     def get_planned_flight(
         self,
-        airline_iata: str,
+        airline: str,
         flight_number: str,
-        flight_date_local: str,
-    ) -> Optional[Dict[str, Any]]:
+        date_str: str,
+        *,
+        origin: Optional[str] = None,
+        dest: Optional[str] = None
+    ) -> Optional[PlannedFlight]:
         """
-        Return a dict-like PlannedFlight (provider-dependent) or None.
-        Tries providers in prefer_order until one returns a result.
+        Try each provider in order. Pass through origin/dest hints when supported.
         """
-        last_err = None
-        for name in self.prefer_order:
-            prov = self._provider(name)
-            if not hasattr(prov, "get_planned_flight"):
-                continue
+        last_err: Optional[Exception] = None
+        for key in self.order:
+            prov = self.providers[key.lower()]
             try:
-                out = prov.get_planned_flight(airline_iata, flight_number, flight_date_local)
-                if out:
-                    if isinstance(out, dict):
-                        out["_provider"] = name
+                # Prefer calling with origin/dest when the provider accepts them.
+                try:
+                    out = prov.get_planned_flight(airline, flight_number, date_str, origin=origin, dest=dest)  # type: ignore[arg-type]
+                except TypeError:
+                    out = prov.get_planned_flight(airline, flight_number, date_str)  # type: ignore[call-arg]
+
+                if out is not None:
                     return out
-            except NotImplementedError:
-                continue
             except Exception as e:
                 last_err = e
                 continue
         if last_err:
             raise last_err
         return None
-
-    # --- day-of/historical airport windows (OpenSky typically) ---
-    def get_departures(self, airport_iata: str, begin_epoch: int, end_epoch: int):
-        last_err = None
-        for name in self.prefer_order:
-            prov = self._provider(name)
-            if hasattr(prov, "get_departures"):
-                try:
-                    return prov.get_departures(airport_iata, begin_epoch, end_epoch)
-                except Exception as e:
-                    last_err = e
-                    continue
-        if last_err:
-            raise last_err
-        raise RuntimeError("No provider could serve get_departures")
-
-    def get_arrivals(self, airport_iata: str, begin_epoch: int, end_epoch: int):
-        last_err = None
-        for name in self.prefer_order:
-            prov = self._provider(name)
-            if hasattr(prov, "get_arrivals"):
-                try:
-                    return prov.get_arrivals(airport_iata, begin_epoch, end_epoch)
-                except Exception as e:
-                    last_err = e
-                    continue
-        if last_err:
-            raise last_err
-        raise RuntimeError("No provider could serve get_arrivals")
-
-    # Optional helper (if a provider implements it)
-    def get_by_callsign(self, callsign: str, begin_epoch: int, end_epoch: int):
-        last_err = None
-        for name in self.prefer_order:
-            prov = self._provider(name)
-            if hasattr(prov, "get_by_callsign"):
-                try:
-                    return prov.get_by_callsign(callsign, begin_epoch, end_epoch)
-                except Exception as e:
-                    last_err = e
-                    continue
-        if last_err:
-            raise last_err
-        raise RuntimeError("No provider could serve get_by_callsign")

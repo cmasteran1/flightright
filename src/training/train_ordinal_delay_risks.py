@@ -49,11 +49,11 @@ NUMS_CAND = [
     "origin_windspeed_10m_max","origin_windgusts_10m_max",
     "dest_temperature_2m_max","dest_temperature_2m_min","dest_precipitation_sum",
     "dest_windspeed_10m_max","dest_windgusts_10m_max",
-    #"origin_dep_temperature_2m","origin_dep_windspeed_10m","origin_dep_windgusts_10m","origin_dep_precipitation",
-    #"dest_arr_temperature_2m","dest_arr_windspeed_10m","dest_arr_windgusts_10m","dest_arr_precipitation",
+    "origin_dep_temperature_2m","origin_dep_windspeed_10m","origin_dep_windgusts_10m","origin_dep_precipitation",
+    "dest_arr_temperature_2m","dest_arr_windspeed_10m","dest_arr_windgusts_10m","dest_arr_precipitation",
     # optional lagged dest wx features if you added them:
-    #"dest_arr_wx_max_code_prev_2h","dest_arr_wx_any_gt3_prev_2h",
-    #"dest_arr_precip_sum_prev_3h","dest_arr_wind_max_prev_3h","dest_arr_gust_max_prev_3h",
+    "dest_arr_wx_max_code_prev_2h","dest_arr_wx_any_gt3_prev_2h",
+    "dest_arr_precip_sum_prev_3h","dest_arr_wind_max_prev_3h","dest_arr_gust_max_prev_3h",
 ]
 
 THRESHOLDS = [15, 30, 45, 60]  # minutes

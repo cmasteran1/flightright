@@ -1,6 +1,6 @@
 {
   "snow_codes": [71,73,75,77,85,86],
-  "reliability_bins": 12,
+  "reliability_bins": 6,
   "fp_delay_min": 10,
   "fn_delay_min": 30
 }

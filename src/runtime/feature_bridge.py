@@ -93,3 +93,24 @@ class FeatureBridge:
         if sel.empty or col not in hourly.columns:
             return np.nan
         return float(sel.iloc[0][col])
+
+from runtime.providers.history.opensky_history import OpenSkyHistory
+from runtime.providers.history.aggregates import RecentAggregates
+
+def build_recent_history_features(
+        airline_iata: str,
+        origin_iata: str,
+        dest_iata: str,
+        day_start_unix_utc: int,
+        iata_icao_map_csv: str = "data/meta/iata_icao_map.csv",
+        carrier_csv: str = "src/utils/carrier.csv",
+        use_aerodatabox_exact_flight: bool = False,
+        flight_number: Optional[str] = None,
+        aerodatabox_provider: Optional[object] = None,
+) -> dict:
+    osh = OpenSkyHistory(iata_icao_airport_csv=iata_icao_map_csv,
+                         carrier_csv=carrier_csv)
+    agg = RecentAggregates(opensky=osh,
+                           aerodatabox=aerodatabox_provider if use_aerodatabox_exact_flight else None)
+    exact = (airline_iata, flight_number) if (use_aerodatabox_exact_flight and flight_number) else None
+    return agg.compute(airline_iata, origin_iata, dest_iata, day_start_unix_utc, exact_flightnum_mean=exact)

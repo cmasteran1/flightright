@@ -8,11 +8,13 @@ Example:
   export OPENSKY_PASSWORD="..."
   export NWS_USER_AGENT="flightright/0.1 (your_email@example.com)"
 
-  python -m runtime.cli.predict_flight \
-      --models-dir models/UA_weather_minus_historical \
-      --flight UA1536 \
-      --date 2026-01-22 \
-      --prefer aerodatabox,opensky
+python -m runtime.cli.predict_flight \
+  --models-dir models/UA_weather_plus_historical \
+  --flight UA2354 \
+  --od DEN-MCO \
+  --date 2026-01-27 \
+  --prefer aerodatabox,opensky \
+  --verbose
 
 """
 # src/runtime/cli/predict_flight.py
@@ -31,32 +33,38 @@ import pandas as pd
 import joblib
 from catboost import CatBoostClassifier, Pool
 
-# Schedules + Weather providers
+# Schedules + Weather + History providers
 from runtime.providers.flight_source import FlightInfoSource
-from runtime.providers.schedules.aerodatabox import AeroDataBoxProvider  # noqa: F401 (import hints)
+from runtime.providers.schedules.aerodatabox import AeroDataBoxProvider  # noqa: F401
 from runtime.providers.weather.nws import NWSProvider
+from runtime.providers.schedules.aerodatabox_history import AeroDataBoxHistory
 
 # ----------------------------
 # Constants / Config
 # ----------------------------
 THRESHOLDS = [15, 30, 45, 60]
+AIRPORTS_CSV = "data/meta/airports.csv"   # hard-coded per your earlier request
 
-# Hard-coded airports CSV (as requested)
-AIRPORTS_CSV = "data/meta/airports.csv"
-
-# Candidate feature names (keep in sync with training-time names)
+# Feature names (align with training script)
 CATS_CAND = [
     "Origin", "Dest", "Reporting_Airline", "OD_pair",
     "origin_weathercode", "dest_weathercode",
     "origin_dep_weathercode", "dest_arr_weathercode",
 ]
 NUMS_CAND = [
+    # traffic / history (REQUIRED; will hard-fail if missing)
+    "dep_count_origin_bin", "arr_count_dest_trail_2h",
+    "carrier_flights_prior_day", "carrier_delay_7d_mean",
+    "od_delay_7d_mean", "flightnum_delay_14d_mean",
+    "origin_delay_7d_mean", "dest_delay_7d_mean",
+
     # daily (origin/dest)
     "origin_temperature_2m_max", "origin_temperature_2m_min", "origin_precipitation_sum",
     "origin_windspeed_10m_max", "origin_windgusts_10m_max",
     "dest_temperature_2m_max", "dest_temperature_2m_min", "dest_precipitation_sum",
     "dest_windspeed_10m_max", "dest_windgusts_10m_max",
-    # hourly at dep/arr
+
+    # hourly aligned (dep/arr)
     "origin_dep_temperature_2m", "origin_dep_windspeed_10m", "origin_dep_windgusts_10m", "origin_dep_precipitation",
     "dest_arr_temperature_2m", "dest_arr_windspeed_10m", "dest_arr_windgusts_10m", "dest_arr_precipitation",
 ]
@@ -125,7 +133,6 @@ def explain_top_reasons(model: CatBoostClassifier, X_row: pd.DataFrame, cat_feat
     return phrases
 
 def _split_flight(s: str) -> Tuple[str, str]:
-    # e.g. "UA1536" → ("UA","1536") ; "UA 1536" also ok
     m = re.match(r"^\s*([A-Za-z]{2})\s*0*([0-9]+)\s*$", s)
     if not m:
         raise ValueError(f"Unparseable flight code: {s}")
@@ -133,14 +140,13 @@ def _split_flight(s: str) -> Tuple[str, str]:
 
 def _load_airports_csv(path: str) -> pd.DataFrame:
     df = pd.read_csv(path)
-    # normalize expected columns
-    # expect headers: IATA, AirportName, City, Country, State, Latitude, Longitude, Timezone
     lower = {c.lower(): c for c in df.columns}
-    need = ["iata", "latitude", "longitude", "timezone"]
+    need = ["iata", "latitude", "longitude", "timezone", "icao"]
     for key in need:
         if key not in lower:
             raise RuntimeError(f"airports.csv missing column like {key}")
     return df.rename(columns={lower["iata"]: "IATA",
+                              lower["icao"]: "ICAO",
                               lower["latitude"]: "Latitude",
                               lower["longitude"]: "Longitude",
                               lower["timezone"]: "Timezone"})
@@ -159,7 +165,6 @@ def _fmt(v, unit: str | None = None, nd=1):
     return f"{round(float(v), nd)}"
 
 def _print_weather_block(title: str, w: Dict[str, Any], dep_label: str = "dep"):
-    # Daily
     tmax = w.get("temperature_2m_max")
     tmin = w.get("temperature_2m_min")
     psum = w.get("precipitation_sum", 0.0)
@@ -167,7 +172,6 @@ def _print_weather_block(title: str, w: Dict[str, Any], dep_label: str = "dep"):
     wg   = w.get("windgusts_10m_max")
     wcode_day = w.get("wx_code_day", "Unknown")
 
-    # Hourly @ dep/arr
     ht  = w.get("dep_temperature_2m")
     hw  = w.get("dep_windspeed_10m")
     hg  = w.get("dep_windgusts_10m")
@@ -193,7 +197,8 @@ def main():
     ap = argparse.ArgumentParser(description="Predict delay bins for a planned flight using trained ordinal models.")
     ap.add_argument("--models-dir", required=True, help="Directory containing ordinal models (with registry.json).")
     ap.add_argument("--flight", required=True, help="Flight like UA1536 or 'UA 1536'.")
-    ap.add_argument("--date", required=True, help="Local departure date YYYY-MM-DD (origin local date).")
+    ap.add_argument("--date", required=True, help="Origin local departure date YYYY-MM-DD.")
+    ap.add_argument("--od", required=True, help="OD pair like DEN-MCO (required; resolves same-number multi-legs).")
     ap.add_argument("--prefer", default="aerodatabox,opensky", help="Comma list of schedule providers preference.")
     ap.add_argument("--verbose", action="store_true")
     args = ap.parse_args()
@@ -204,18 +209,58 @@ def main():
         sys.exit(2)
 
     airline_iata, flight_number = _split_flight(args.flight)
-
-    # ---------------- SCHEDULE LOOKUP ----------------
+    req_origin_iata, req_dest_iata = [s.strip().upper() for s in args.od.split("-")]
     prefer_order = [p.strip().lower() for p in args.prefer.split(",") if p.strip()]
     log(f"[INFO] Schedule providers preference: {prefer_order}")
 
+    # ---------------- SCHEDULE LOOKUP (OD aware) ----------------
     src = FlightInfoSource(prefer_order=prefer_order)
     planned = src.get_planned_flight(airline_iata, flight_number, args.date)
+
+    if planned and (planned.origin != req_origin_iata or planned.dest != req_dest_iata):
+        # Try OD-disambiguated selection via AeroDataBox (using the same working endpoint)
+        print(f"[WARN] Provider returned {planned.origin}->{planned.dest} but required {req_origin_iata}->{req_dest_iata}. "
+              f"Trying OD-aware AeroDataBox lookup...")
+        from types import SimpleNamespace
+        # Use number/day result and pick the leg matching OD
+        legs = AeroDataBoxHistory(
+            api_key=os.getenv("AERODATABOX_API_KEY", "")
+        )._fetch_number_day(airline_iata, flight_number, args.date)
+        match = None
+        for leg in legs:
+            dep = ((leg.get("departure") or {}).get("airport") or {}).get("iata", "")
+            arr = ((leg.get("arrival")  or {}).get("airport") or {}).get("iata", "")
+            if dep.upper() == req_origin_iata and arr.upper() == req_dest_iata:
+                # derive HHMM from scheduled local times
+                dep_loc = (((leg.get("departure") or {}).get("scheduledTime") or {}).get("local") or "")
+                arr_loc = (((leg.get("arrival")  or {}).get("scheduledTime") or {}).get("local") or "")
+                def _hhmm_from_local(t: str) -> str:
+                    t = t.replace(" ", "T")
+                    try:
+                        dt = datetime.fromisoformat(t)
+                        return f"{dt.hour:02d}{dt.minute:02d}"
+                    except Exception:
+                        return "0000"
+                match = SimpleNamespace(
+                    airline=airline_iata.upper(),
+                    flight_number=flight_number,
+                    flight_date=None,
+                    origin=req_origin_iata,
+                    dest=req_dest_iata,
+                    crs_dep_time=_hhmm_from_local(dep_loc),
+                    crs_arr_time=_hhmm_from_local(arr_loc),
+                    aircraft=(leg.get("aircraft") or {}).get("model"),
+                    tail=(leg.get("aircraft") or {}).get("reg"),
+                    extra={"raw": leg},
+                )
+                break
+        planned = match
+
     if planned is None:
         print("[ERROR] Could not obtain planned schedule for the flight/date.", file=sys.stderr)
         sys.exit(2)
 
-    log(f"[INFO] Planned: {planned}")
+    log(f"[INFO] Planned (OD-picked via AeroDataBox): {planned}")
 
     # origin/dest + HHMM
     origin = planned.origin
@@ -226,42 +271,68 @@ def main():
     arr_hour_local = _hhmm_to_hour(arr_hhmm)
 
     # ---------------- WEATHER (NWS) ----------------
-    # airports.csv → lat/lon
     ap_df = _load_airports_csv(AIRPORTS_CSV)
-
     orow = _iata_row(ap_df, origin)
     drow = _iata_row(ap_df, dest)
+    o_lat, o_lon, o_icao = float(orow["Latitude"]), float(orow["Longitude"]), str(orow["ICAO"])
+    d_lat, d_lon, d_icao = float(drow["Latitude"]), float(drow["Longitude"]), str(drow["ICAO"])
 
-    o_lat, o_lon = float(orow["Latitude"]), float(orow["Longitude"])
-    d_lat, d_lon = float(drow["Latitude"]), float(drow["Longitude"])
     log(f"[INFO] Origin {origin} lat/lon=({o_lat},{o_lon}) dep_hour_local={dep_hour_local}")
     log(f"[INFO] Dest   {dest}  lat/lon=({d_lat},{d_lon}) arr_hour_local={arr_hour_local}")
 
     nws = NWSProvider(user_agent=os.getenv("NWS_USER_AGENT", "flight-delay-model/0.1 (no-user-agent-set)"))
-
     w_or = nws.get_features(o_lat, o_lon, args.date, dep_hour_local)
-    log(f"[INFO] NWS origin window: {w_or.get('valid_from_utc')} → {w_or.get('valid_to_utc')} (available={w_or.get('available')})")
-    # For destination we use the provided date and ARR hour; adjust later if you want to auto-advance date for overnight arrivals.
     w_de = nws.get_features(d_lat, d_lon, args.date, arr_hour_local)
+    log(f"[INFO] NWS origin window: {w_or.get('valid_from_utc')} → {w_or.get('valid_to_utc')} (available={w_or.get('available')})")
     log(f"[INFO] NWS dest   window: {w_de.get('valid_from_utc')} → {w_de.get('valid_to_utc')} (available={w_de.get('available')})")
 
-    # >>> Weather Summary Prints (restored) <<<
     _print_weather_block(f"{origin} (Origin)", w_or, dep_label="DEP")
     _print_weather_block(f"{dest} (Destination)", w_de, dep_label="ARR")
 
+    # ---------------- HISTORY (AeroDataBox, cached, minimal calls) ----------------
+    adb_hist = AeroDataBoxHistory(api_key=os.getenv("AERODATABOX_API_KEY", ""))
+    roll = adb_hist.get_rollups(
+        airline_iata=airline_iata,
+        flight_number=flight_number,
+        origin_iata=origin,
+        dest_iata=dest,
+        origin_icao=o_icao,
+        dest_icao=d_icao,
+        origin_local_date=args.date,
+    )
+
     # ---------------- BUILD FEATURES ----------------
-    feat = {}
+    feat: Dict[str, Any] = {}
 
     # Categorical
     feat["Origin"] = origin
     feat["Dest"] = dest
     feat["Reporting_Airline"] = airline_iata
     feat["OD_pair"] = f"{origin}_{dest}"
-
     feat["origin_weathercode"]     = w_or.get("wx_code_day") or "Unknown"
     feat["dest_weathercode"]       = w_de.get("wx_code_day") or "Unknown"
     feat["origin_dep_weathercode"] = w_or.get("wx_code_hour") or "Unknown"
     feat["dest_arr_weathercode"]   = w_de.get("wx_code_hour") or "Unknown"
+
+    # REQUIRED history/traffic features (strict)
+    required_hist = [
+        "carrier_flights_prior_day",
+        "carrier_delay_7d_mean",
+        "od_delay_7d_mean",
+        "flightnum_delay_14d_mean",
+        "origin_delay_7d_mean",
+        "dest_delay_7d_mean",
+    ]
+    for k in required_hist:
+        v = roll.get(k)
+        if v is None:
+            print(f"[ERROR] Missing historical metric `{k}`; cannot proceed.", file=sys.stderr)
+            sys.exit(2)
+        feat[k] = float(v)
+
+    # Optional recent traffic placeholders (0.0 if you don’t compute them here)
+    feat["dep_count_origin_bin"] = 0.0
+    feat["arr_count_dest_trail_2h"] = 0.0
 
     # Numeric daily (origin)
     feat["origin_temperature_2m_max"] = _safe_float(w_or.get("temperature_2m_max"))
@@ -282,18 +353,16 @@ def main():
     feat["origin_dep_windspeed_10m"]  = _safe_float(w_or.get("dep_windspeed_10m"))
     feat["origin_dep_windgusts_10m"]  = _safe_float(w_or.get("dep_windgusts_10m"))
     feat["origin_dep_precipitation"]  = _safe_float(w_or.get("dep_precipitation"), 0.0)
-
-    feat["dest_arr_temperature_2m"] = _safe_float(w_de.get("dep_temperature_2m"))
-    feat["dest_arr_windspeed_10m"]  = _safe_float(w_de.get("dep_windspeed_10m"))
-    feat["dest_arr_windgusts_10m"]  = _safe_float(w_de.get("dep_windgusts_10m"))
-    feat["dest_arr_precipitation"]  = _safe_float(w_de.get("dep_precipitation"), 0.0)
+    feat["dest_arr_temperature_2m"]   = _safe_float(w_de.get("dep_temperature_2m"))
+    feat["dest_arr_windspeed_10m"]    = _safe_float(w_de.get("dep_windspeed_10m"))
+    feat["dest_arr_windgusts_10m"]    = _safe_float(w_de.get("dep_windgusts_10m"))
+    feat["dest_arr_precipitation"]    = _safe_float(w_de.get("dep_precipitation"), 0.0)
 
     X = pd.DataFrame([feat])
 
-    # Cast types like training
+    # Types like training
     cat_feats_present = [c for c in CATS_CAND if c in X.columns]
     num_feats_present = [c for c in NUMS_CAND if c in X.columns]
-
     for c in cat_feats_present:
         X[c] = as_str(X[c])
     for c in num_feats_present:
@@ -307,7 +376,7 @@ def main():
         with pd.option_context("display.max_columns", None):
             print(X.iloc[0])
 
-    # ---------------- MODELS: load registry + ensure feature order ----------------
+    # ---------------- MODELS ----------------
     reg_path = models_dir / "registry.json"
     if not reg_path.exists():
         print(f"[ERROR] registry.json not found in {models_dir}", file=sys.stderr)
@@ -317,6 +386,7 @@ def main():
 
     log(f"[INFO] Loading models from {models_dir}")
 
+    # Try to preserve trained feature order (from thr_15/meta.json)
     meta_cat, meta_num = None, None
     try:
         meta_path = models_dir / "thr_15" / "meta.json"
@@ -344,18 +414,15 @@ def main():
         cat_feats_use = cat_feats_present
         num_feats_use = num_feats_present
 
-    # ---------------- Load calibrated models + raw for explanations ----------------
+    # Load calibrated + raw for explanations
     calibrators: Dict[int, Any] = {}
     raw_models: Dict[int, CatBoostClassifier] = {}
-
     for thr in THRESHOLDS:
         info = registry.get(str(thr))
         if not info:
             print(f"[ERROR] Threshold {thr} missing in registry.json", file=sys.stderr)
             sys.exit(2)
-        cal = joblib.load(info["cal_path"])
-        calibrators[thr] = cal
-
+        calibrators[thr] = joblib.load(info["cal_path"])
         m = CatBoostClassifier()
         m.load_model(info["model_path"])
         raw_models[thr] = m
@@ -365,7 +432,7 @@ def main():
     for thr in THRESHOLDS:
         cal = calibrators[thr]
         p = cal.predict_proba(X)[:, 1]
-        proba[thr] = float(np.clip(p[0], 0.0, 1.0))  # scalarize
+        proba[thr] = float(np.clip(p[0], 0.0, 1.0))
 
     out = pd.DataFrame(index=[0])
     out["p_ge_15"] = proba[15]
@@ -373,16 +440,16 @@ def main():
     out["p_ge_45"] = proba[45]
     out["p_ge_60"] = proba[60]
 
-    # Enforce monotone tails (left→right: 60,45,30,15)
+    # Enforce monotone tails (60→45→30→15)
     enforce_tail_monotone(out, ["p_ge_60","p_ge_45","p_ge_30","p_ge_15"])
     out["p_on_time"] = 1.0 - out["p_ge_15"]
 
-    # Percentages for display
+    # Percent display
     out["on_time_pct"] = (100 * out["p_on_time"]).round(1)
-    out["ge15_pct"] = (100 * out["p_ge_15"]).round(1)
-    out["ge30_pct"] = (100 * out["p_ge_30"]).round(1)
-    out["ge45_pct"] = (100 * out["p_ge_45"]).round(1)
-    out["ge60_pct"] = (100 * out["p_ge_60"]).round(1)
+    out["ge15_pct"]    = (100 * out["p_ge_15"]).round(1)
+    out["ge30_pct"]    = (100 * out["p_ge_30"]).round(1)
+    out["ge45_pct"]    = (100 * out["p_ge_45"]).round(1)
+    out["ge60_pct"]    = (100 * out["p_ge_60"]).round(1)
 
     # Explain (≥15 model)
     phrases = explain_top_reasons(raw_models[15], X, cat_feats_use, num_feats_use, top_k=3)
@@ -394,7 +461,6 @@ def main():
     print(f"On-time (0–14m): {r0.on_time_pct:.1f}%")
     print(f"≥15m: {r0.ge15_pct:.1f}%  | ≥30m: {r0.ge30_pct:.1f}%  | ≥45m: {r0.ge45_pct:.1f}%  | ≥60m: {r0.ge60_pct:.1f}%")
 
-    # Disjoint bins from tails
     p15 = float(r0.p_ge_15); p30 = float(r0.p_ge_30); p45 = float(r0.p_ge_45); p60 = float(r0.p_ge_60)
     b15_29 = max(0.0, p15 - p30)
     b30_44 = max(0.0, p30 - p45)
@@ -402,6 +468,10 @@ def main():
     b60p   = max(0.0, p60)
     b0_14  = max(0.0, 1.0 - p15)
     print(f"Bins → 0–14: {100*b0_14:.1f}% | 15–29: {100*b15_29:.1f}% | 30–44: {100*b30_44:.1f}% | 45–59: {100*b45_59:.1f}% | 60+: {100*b60p:.1f}%")
+
+    # Units note (for your logs)
+    print("\n[UNITS] AeroDataBox time fields are ISO timestamps (local/UTC in payload); delays are computed by us in minutes.")
+    print("[UNITS] Weather: NWS temps=°C, wind/windgust=m/s, precipitation=mm (as presented in our pipeline).")
 
     print(f"Why: {why}")
 
