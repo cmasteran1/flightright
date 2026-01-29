@@ -285,11 +285,12 @@ def downsample_rows(df: pd.DataFrame, cfg: dict) -> pd.DataFrame:
 # ----------------- airport coords + tz -----------------
 def _coerce_airport_coords_with_tz(airport_json_path: str):
     """
-    Returns dict: { IATA (upper): (lat, lon, tz_name or None) }.
-    Supports:
-      - {"airport_coords": {"JFK":[lat,lon,"America/New_York"], "PHX":{"lat":..,"lon":..,"tz":"America/Phoenix"}}}
-      - Or top-level dict with same structure.
-    If tz is missing and timezonefinder is available, infer from lat/lon.
+    Returns dict: { IATA (upper): (lat, lon, tz_name) }.
+
+    Policy (strict):
+      - Every airport must have a valid (lat, lon) and an IANA tz name.
+      - If tz is missing but lat/lon present, we compute it with timezonefinder.
+      - If still missing (or lat/lon missing), we RAISE a RuntimeError listing offenders.
     """
     with open(airport_json_path, "r") as f:
         data = json.load(f)
@@ -297,7 +298,8 @@ def _coerce_airport_coords_with_tz(airport_json_path: str):
         data = data["airport_coords"]
 
     out = {}
-    resolved = 0
+    resolved_tz = 0
+
     for k, v in data.items():
         ap = str(k).upper()
         lat = lon = tz = None
@@ -310,33 +312,59 @@ def _coerce_airport_coords_with_tz(airport_json_path: str):
             if len(v) >= 3:
                 tz = v[2]
         else:
-            continue
+            # malformed entry; leave as None to be caught below
+            pass
 
+        # last-resort manual tz map (kept; but we still crash later if not set)
+        manual = {
+            "JFK":"America/New_York", "LGA":"America/New_York", "EWR":"America/New_York",
+            "BOS":"America/New_York", "PHL":"America/New_York", "BWI":"America/New_York",
+            "ATL":"America/New_York", "MCO":"America/New_York", "MIA":"America/New_York",
+            "ORD":"America/Chicago",  "DFW":"America/Chicago",  "IAH":"America/Chicago",
+            "DEN":"America/Denver",   "PHX":"America/Phoenix",
+            "LAS":"America/Los_Angeles", "LAX":"America/Los_Angeles", "SFO":"America/Los_Angeles",
+            "SEA":"America/Los_Angeles", "PDX":"America/Los_Angeles",
+        }
+        if tz is None and ap in manual:
+            tz = manual[ap]
+
+        # If tz still missing but coords present, try to compute
         if tz is None and _TF is not None and lat is not None and lon is not None:
             try:
-                tz = _TF.timezone_at(lng=float(lon), lat=float(lat))
-                if tz:
-                    resolved += 1
+                tz_guess = _TF.timezone_at(lng=float(lon), lat=float(lat))
+                if tz_guess:
+                    tz = tz_guess
+                    resolved_tz += 1
             except Exception:
-                tz = None
+                pass
 
-        if tz is None:
-            manual = {
-                "JFK":"America/New_York", "LGA":"America/New_York", "EWR":"America/New_York",
-                "BOS":"America/New_York", "PHL":"America/New_York", "BWI":"America/New_York",
-                "ATL":"America/New_York", "MCO":"America/New_York", "MIA":"America/New_York",
-                "ORD":"America/Chicago",  "DFW":"America/Chicago",  "IAH":"America/Chicago",
-                "DEN":"America/Denver",   "PHX":"America/Phoenix",
-                "LAS":"America/Los_Angeles", "LAX":"America/Los_Angeles", "SFO":"America/Los_Angeles",
-                "SEA":"America/Los_Angeles", "PDX":"America/Los_Angeles",
-            }
-            tz = manual.get(ap)
+        # Record; validation below
+        out[ap] = (
+            float(lat) if lat is not None else None,
+            float(lon) if lon is not None else None,
+            tz
+        )
 
-        out[ap] = (float(lat) if lat is not None else None,
-                   float(lon) if lon is not None else None,
-                   tz)
-    if resolved:
-        print(f"[INFO] tz resolved by timezonefinder: {resolved}")
+    if resolved_tz:
+        print(f"[INFO] tz resolved by timezonefinder: {resolved_tz}")
+
+    # Validate: every airport must have lat,lon,tz
+    missing_latlon = [ap for ap,(lat,lon,tz) in out.items() if lat is None or lon is None]
+    missing_tz     = [ap for ap,(lat,lon,tz) in out.items() if tz is None]
+
+    msgs = []
+    if missing_latlon:
+        msgs.append(f"missing lat/lon for: {missing_latlon[:20]}{' ...' if len(missing_latlon)>20 else ''}")
+    if missing_tz:
+        msgs.append(f"missing timezone for: {missing_tz[:20]}{' ...' if len(missing_tz)>20 else ''}")
+
+    if msgs:
+        raise RuntimeError(
+            "[AIRPORT TZ ERROR] Airport coordinate/timezone resolution failed:\n  - " +
+            "\n  - ".join(msgs) +
+            "\nFix airport_json entries to include lat/lon and (preferably) 'tz' or ensure timezonefinder can infer it."
+        )
+
     return out
 
 def _mk_local_dt(flight_date: pd.Timestamp, hhmm, tz_name: str):
@@ -357,6 +385,8 @@ def add_timezone_local_times(df, airport_json: str):
       - arr_dt_local (Dest tz; adds +1 day if arr HHMM < dep HHMM)
       - dep_local_date / arr_local_date (local calendar dates)
       - dep_bin30_local / arr_bin30_local (local 30-min bins)
+
+    STRICT: Will raise if any airport lacks tz/coords (enforced by _coerce_airport_coords_with_tz).
     """
     coords_tz = _coerce_airport_coords_with_tz(airport_json)
 
@@ -364,8 +394,8 @@ def add_timezone_local_times(df, airport_json: str):
     df["Origin"] = df["Origin"].astype(str).str.upper()
     df["Dest"]   = df["Dest"].astype(str).str.upper()
 
-    df["Origin_TZ"] = df["Origin"].map(lambda a: coords_tz.get(a, (None,None,None))[2])
-    df["Dest_TZ"]   = df["Dest"].map(lambda a: coords_tz.get(a, (None,None,None))[2])
+    df["Origin_TZ"] = df["Origin"].map(lambda a: coords_tz[a][2])
+    df["Dest_TZ"]   = df["Dest"].map(lambda a: coords_tz[a][2])
 
     dep_locals, arr_locals = [], []
     for r in df.itertuples(index=False):
@@ -628,8 +658,10 @@ DAILY_WEATHER_VARS = [
     "windspeed_10m_max","windgusts_10m_max","weathercode"
 ]
 
-def _fetch_daily_weather(lat, lon, start, end, tz="America/New_York"):
+def _fetch_daily_weather(lat, lon, start, end, tz):
     import requests
+    if tz is None:
+        raise RuntimeError("Daily weather fetch requires per-airport timezone (tz is None).")
     url = "https://archive-api.open-meteo.com/v1/archive"
     r = requests.get(url, params={
         "latitude": lat, "longitude": lon,
@@ -643,7 +675,7 @@ def _fetch_daily_weather(lat, lon, start, end, tz="America/New_York"):
     w["FlightDate"] = pd.to_datetime(w["time"])
     return w.drop(columns=["time"])
 
-def _get_weather_for_airports_daily(df, coords_map, tz_default="America/New_York", cache_dir="../../data/weather_cache"):
+def _get_weather_for_airports_daily(df, coords_map, cache_dir="../../data/weather_cache"):
     Path(cache_dir).mkdir(parents=True, exist_ok=True)
     start = df["FlightDate"].min().strftime("%Y-%m-%d")
     end   = df["FlightDate"].max().strftime("%Y-%m-%d")
@@ -652,19 +684,15 @@ def _get_weather_for_airports_daily(df, coords_map, tz_default="America/New_York
     origin_frames, dest_frames = [], []
 
     for ap in needed:
-        lat, lon, tz = coords_map.get(ap, (None,None,None))
-        if lat is None or lon is None:
-            print(f"[WARN] Missing coords for {ap}; skipping weather.")
-            continue
-        tz_to_use = tz or tz_default
-        safe_tz = (tz_to_use or tz_default).replace("/", "__")
+        lat, lon, tz = coords_map[ap]  # strict: keys guaranteed, tz validated
+        safe_tz = tz.replace("/", "__")
         cache_path = Path(cache_dir) / f"{ap}_{start}_{end}_{safe_tz}_daily.parquet"
 
         cache_path.parent.mkdir(parents=True, exist_ok=True)
         if cache_path.exists():
             wx = pd.read_parquet(cache_path)
         else:
-            wx = _fetch_daily_weather(lat, lon, start, end, tz=tz_to_use)
+            wx = _fetch_daily_weather(lat, lon, start, end, tz=tz)
             wx.to_parquet(cache_path, index=False)
 
         ow = wx.copy(); ow["Origin"] = ap
@@ -679,9 +707,9 @@ def _get_weather_for_airports_daily(df, coords_map, tz_default="America/New_York
     dest_df   = pd.concat(dest_frames,   ignore_index=True) if dest_frames   else pd.DataFrame()
     return origin_df, dest_df
 
-def add_origin_dest_weather_daily(df, airport_json, tz="America/New_York", cache_dir="data/weather_cache"):
+def add_origin_dest_weather_daily(df, airport_json, cache_dir="data/weather_cache"):
     coords_map = _coerce_airport_coords_with_tz(airport_json)
-    ow, dw = _get_weather_for_airports_daily(df, coords_map, tz_default=tz, cache_dir=cache_dir)
+    ow, dw = _get_weather_for_airports_daily(df, coords_map, cache_dir=cache_dir)
     if not ow.empty:
         df = df.merge(ow, on=["FlightDate","Origin"], how="left")
     if not dw.empty:
@@ -727,8 +755,10 @@ def _req_with_backoff(url, params, max_tries=5):
         r.raise_for_status()
     r.raise_for_status()
 
-def _fetch_hourly_weather(lat, lon, start, end, tz="America/New_York"):
+def _fetch_hourly_weather(lat, lon, start, end, tz):
     """Fetch one chunk of hourly series from Open-Meteo archive."""
+    if tz is None:
+        raise RuntimeError("Hourly weather fetch requires per-airport timezone (tz is None).")
     url = "https://archive-api.open-meteo.com/v1/archive"
     r = _req_with_backoff(url, {
         "latitude": lat, "longitude": lon,
@@ -749,7 +779,7 @@ def _fetch_hourly_weather_all(lat, lon, start_dt, end_dt, tz):
     """Fetch across [start_dt, end_dt] using monthly chunks, cache per chunk, concat."""
     frames = []
     start_s, end_s = start_dt.strftime("%Y-%m-%d"), end_dt.strftime("%Y-%m-%d")
-    safe_tz = (tz or "America/New_York").replace("/", "__")
+    safe_tz = tz.replace("/", "__")
     cache_root = Path("../../data/weather_cache/hourly")
     cache_root.mkdir(parents=True, exist_ok=True)
 
@@ -906,20 +936,15 @@ def _build_dest_lagged_features(dw: pd.DataFrame, cfg: dict):
 
     return z
 
-def _get_weather_for_airports_hourly(df, coords_map, tz_default="America/New_York", cache_dir="data/weather_cache"):
+def _get_weather_for_airports_hourly(df, coords_map, cache_dir="data/weather_cache"):
     start_dt, end_dt = _get_dep_arr_time_bounds(df)
 
     needed = pd.unique(pd.concat([df["Origin"], df["Dest"]]).astype(str).str.upper())
     per_origin, per_dest = {}, {}
 
     for ap in needed:
-        lat, lon, tz = coords_map.get(ap, (None, None, None))
-        if lat is None or lon is None:
-            print(f"[WARN] Missing coords for {ap}; skipping HOURLY weather.")
-            continue
-        tz_to_use = tz or tz_default
-
-        wx = _fetch_hourly_weather_all(lat, lon, start_dt, end_dt, tz=tz_to_use)
+        lat, lon, tz = coords_map[ap]  # strict: tz must exist
+        wx = _fetch_hourly_weather_all(lat, lon, start_dt, end_dt, tz=tz)
 
         ow = wx.copy()
         for c in HOURLY_VARS:
@@ -940,15 +965,15 @@ def _get_weather_for_airports_hourly(df, coords_map, tz_default="America/New_Yor
     dest_df   = pd.concat(per_dest.values(),   ignore_index=True) if per_dest   else pd.DataFrame()
     return origin_df, dest_df
 
-def add_origin_dest_weather_hourly(df, airport_json, tz="America/New_York", cache_dir="data/weather_cache"):
+def add_origin_dest_weather_hourly(df, airport_json, cache_dir="data/weather_cache"):
     """
     Align hourly weather to:
       - Origin departure hour (dep_dt_local floored to hour)
       - Dest arrival hour (arr_dt_local floored to hour)
-    Uses each airport's own time zone for the hourly series.
+    Uses each airport's own time zone for the hourly series (strict).
     """
     coords_map = _coerce_airport_coords_with_tz(airport_json)
-    ow, dw = _get_weather_for_airports_hourly(df, coords_map, tz_default=tz, cache_dir=cache_dir)
+    ow, dw = _get_weather_for_airports_hourly(df, coords_map, cache_dir=cache_dir)
     if ow.empty and dw.empty:
         print("[WARN] Hourly weather frames are empty; skipping hourly merge.")
         return df
@@ -1185,7 +1210,7 @@ def main():
     # Exclude selected delay reasons
     df = apply_delay_reason_filters(df, cfg)
 
-    # ---------- Time zones & local times ----------
+    # ---------- Time zones & local times (STRICT per-airport tz) ----------
     airport_json_raw = cfg.get("airport_json", "data/airport_coords.json")
     airport_json = "data/airport_coords.json"
     print(f"[INFO] airport_json -> {airport_json}  (exists={Path(airport_json).exists()})")
@@ -1228,17 +1253,15 @@ def main():
 
     # ---------- Weather (daily) ----------
     if cfg.get("add_weather", True):
-        tz_default = cfg.get("weather_timezone", "America/New_York")
         cache_dir = str(_resolve_path(cfg.get("weather_cache_dir", "data/weather_cache")))
         Path(cache_dir).mkdir(parents=True, exist_ok=True)
-        df = add_origin_dest_weather_daily(df, airport_json=airport_json, tz=tz_default, cache_dir=cache_dir)
+        df = add_origin_dest_weather_daily(df, airport_json=airport_json, cache_dir=cache_dir)
 
     # ---------- Weather (hourly) ----------
     if cfg.get("add_hourly_weather", True):
-        tz_default = cfg.get("weather_timezone", "America/New_York")
         cache_dir = str(_resolve_path(cfg.get("weather_cache_dir", "data/weather_cache")))
         Path(cache_dir).mkdir(parents=True, exist_ok=True)
-        df = add_origin_dest_weather_hourly(df, airport_json=airport_json, tz=tz_default, cache_dir=cache_dir)
+        df = add_origin_dest_weather_hourly(df, airport_json=airport_json, cache_dir=cache_dir)
 
     # Option: keep only weather codes (drop numeric weather)
     df = keep_only_weather_codes(df, cfg)
@@ -1259,7 +1282,7 @@ def main():
     out_path = _resolve_output_path(out_path_cfg)
     out_path.parent.mkdir(parents=True, exist_ok=True)
     df.to_parquet(out_path, index=False)
-    print(f"[OK] wrote {out_path} with {len(df)} rows")
+    print(f"[OK] wrote {len(df)} rows -> {out_path}")
 
 if __name__ == "__main__":
     main()

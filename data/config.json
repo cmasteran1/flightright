@@ -26,7 +26,7 @@
     "data/raw_bts/Year=2024/Month=12/flights.parquet"
   ],
   "output_training_path": "data/processed/WN_top50_23-24_weekout.parquet",
-  "airports": ["DEN","MDW","DAL","PHX","LAS","BWI","HOU","OAK","LAX","SAN","SJC","SMF","ONT","BUR","SNA","LGB","PDX","SEA","SLC","PHX","TUS","ABQ","ELP","AUS","SAT","DFW","IAH","MSY","BNA","ATL","MCO","TPA","FLL","MIA","PBI","JAX","RSW","RDU","CLT","ORF","RIC","CMH","CLE","DTW","MSP","STL","MCI","OKC","ICT"],
+  "airports": ["DEN","MDW","DAL","LAS","BWI","HOU","OAK","LAX","SAN","SJC","SMF","ONT","BUR","SNA","LGB","PDX","SEA","SLC","PHX","TUS","ABQ","ELP","AUS","SAT","DFW","IAH","MSY","BNA","ATL","MCO","TPA","FLL","MIA","PBI","JAX","RSW","RDU","CLT","ORF","RIC","CMH","CLE","DTW","MSP","STL","MCI","OKC","ICT"],
   "airlines": ["WN"],
   "start_date": "2023-01-01",
   "end_date": "2024-12-30",
@@ -38,16 +38,13 @@
 
   "exclude_delay_reasons": ["security"],
 
-  "tight_turn_min": 40,
   "taxi_window_days": 7,
   "taxi_bin_minutes": 30,
   "add_aircraft_age": true,
 
   "add_weather": true,
   "add_hourly_weather": true,
-  "add_hourly_precip_window": true,
   "airport_json": "src/data/airport_coords.json",
-  "_weather_timezone": "",
   "weather_cache_dir": "data/weather_cache",
 
   "aircraft_registry_csv": "data/aircraft_registry_clean.csv",
@@ -58,14 +55,6 @@
   "flightnum_baseline_days": 14,
   "origin_baseline_days": 7,
   "dest_baseline_days": 7,
-  "delay_threshold_minutes": 15,
-  "filter_weather_delay_only": false,
-  "filter_weather_mode": "positives_only",
-   "lagged_dest_wx": {
-    "code_prev_hours": 2,
-    "precip_prev_hours": 3,
-    "wind_prev_hours": 3,
-    "since_wx_gt3_lookback_hours": 6
-  }
+  "delay_threshold_minutes": 15
 
 }
