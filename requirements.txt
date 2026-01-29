@@ -80,6 +80,7 @@ prompt_toolkit==3.0.51
 psutil==7.0.0
 ptyprocess==0.7.0
 pure_eval==0.2.3
+pyarrow==16.1.0
 pycparser==2.22
 Pygments==2.19.2
 pyparsing==3.2.3
@@ -120,4 +121,8 @@ widgetsnbextension==4.0.14
 xgboost==2.1.4
 zipp==3.23.0
 
-tqdm~=4.67.1
+# ML libs used by training/inference
+catboost==1.2.5
+
+# CLI / progress
+tqdm==4.67.1

@@ -15,8 +15,8 @@ grabbed. Next, the user must modify the data/config.json file to decide which po
 especially for multiple months, the user should filter by airline, airport, etc... other filters present in config.json. This pruning step also adds weather data
 obtained first from open-meteo free weather API and then cached locally for future use. The pruning step is run by: python build_training_set.py ../../config.json
 
-    Now that we have pruned flights with attached weather, we can use the data to build a feature list and run a machine learning algorithm on the data
-right now the days out model uses a catboost classifier algorithm however, developers will add additional models as they become relevant. At this point depending on the
+    Now that we have pruned flights with attached weather, we can use the data to build a feature list and run a machine learning algorithm on the data.
+Right now the days out model uses a catboost classifier algorithm however, developers will add additional models as they become relevant. At this point depending on the
 model we want to construct, we can either build inbound prior data into the model or leave it out. The model will then undergo a calibration step whereby the bins should become
 more accurate by fitting on an external set of data (handled by src/inference/predict_delay_bins.py).
 
@@ -24,4 +24,6 @@ more accurate by fitting on an external set of data (handled by src/inference/pr
 The days out prediction model needs to scrape weather forcast results on demand, obtain recent historical trends for a given route,
 and obtain expected congestion based on scheduled flights to and from origin and destination.
 
-the deployed model is still in development
+Current Deployment model lives in runtime directory. Models can be tested using Command Line Interface (CLI). requires user to have valid credentials to aerodatabox API as well
+as opensky and nws credentials. Weather and flight schedules are pulled as needed. Data is converted into our feature list expectations. Running predictions have cost as API calls to
+aerodatabox are not free passed a given threshold.
