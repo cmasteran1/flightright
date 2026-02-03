@@ -1,0 +1,32 @@
+{
+  "input_flights_path": ["data/raw_bts/Year=2023/Month=*/flights.parquet","data/raw_bts/Year=2024/Month=*/flights.parquet"],
+  "start_date": "2023-3-01",
+  "end_date": "2024-12-31",
+
+  "airlines": ["WN"],
+  "airports": ["DEN","MDW","DAL","PHX","LAS","BWI","HOU","OAK","LAX","SAN","SJC","SMF","ONT","BUR","SNA","LGB","PDX","SEA","SLC","PHX","TUS","ABQ","ELP","AUS","SAT","DFW","IAH","MSY","BNA","ATL","MCO","TPA","FLL","MIA","PBI","JAX","RSW","RDU","CLT","ORF","RIC","CMH","CLE","DTW","MSP","STL","MCI","OKC","ICT"],
+
+  "target": "dep",
+  "label_type": "binary_15",
+  "balance": { "enabled": true, "seed": 42, "max_rows": 40000 },
+
+  "weather": { "daily": true, "hourly": true, "cache_dir": "data/weather_cache" },
+
+  "features_dep": {
+    "n_recent_flightnum_od": 10,
+    "n_days_carrier_network": 7,
+    "n_days_carrier_origin": 7,
+    "holiday_windows": { "thanksgiving": 2, "christmas": 3 }
+  },
+
+  "airport_json": "data/airport_coords.json",
+  "airport_gates_csv": "",
+  "aircraft_registry_csv": "data/aircraft_registry_clean.csv",
+  "airports_csv": "data/meta/airports.csv",
+
+  "output_intermediate_path": "data/intermediate/WN_50_23-25.parquet",
+  "output_training_path": "data/processed/WN_50_23-25.parquet",
+
+  "single_airline": null,
+  "history_min_support": 2
+}
