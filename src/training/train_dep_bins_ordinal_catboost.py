@@ -1,26 +1,27 @@
 #!/usr/bin/env python3
 # src/training/train_dep_bins_ordinal_catboost.py
 #
-# Ordinal (>=15, >=30, >=45, >=60) calibrated binary models -> 5 mutually-exclusive bins:
-#   <15, 15-30, 30-45, 45-60, >=60
+# Ordinal/binned departure-delay probability model via calibrated P(delay >= thr).
 #
-# IMPORTANT: Feature selection is EXPLICIT via config JSON. No guessing.
-"""
-python src/training/train_dep_bins_ordinal_catboost.py \
-  data/processed/WN_50_23-24.parquet \
-  models/dep_bins_WN_50_23-24_weather+_standard \
-  models/WN_50_23-24_weather+_standard.json
-
-"""
+# Run from REPO_ROOT:
+#   python src/training/train_dep_bins_ordinal_catboost.py \
+#       data/processed/features_dep_WN_50_23-25_unbalanced.parquet \
+#       data/models/dep_bins_WN \
+#       data/models/dep_bins_WN_config.json
+#
+# Notes:
+# - You can train each threshold on its OWN balanced feature parquet (recommended) by
+#   setting cfg["per_threshold_train_paths"].
+# - Evaluation/calibration can be done on an unbalanced eval parquet (recommended).
+#
 import os, sys, json, time, signal, faulthandler
 from pathlib import Path
-from typing import Dict, List, Tuple
 
 import numpy as np
 import pandas as pd
 
 from sklearn.model_selection import train_test_split
-from sklearn.metrics import classification_report, confusion_matrix, roc_auc_score, roc_curve, log_loss
+from sklearn.metrics import classification_report, confusion_matrix, roc_auc_score, roc_curve, log_loss, accuracy_score
 from sklearn.calibration import CalibratedClassifierCV
 import joblib
 
@@ -30,12 +31,11 @@ import matplotlib.pyplot as plt
 
 from catboost import CatBoostClassifier, Pool
 
-# -------- env toggles --------
+
 FAST = os.getenv("FAST_TRAIN", "0") == "1"
 NO_PLOTS = os.getenv("NO_PLOTS", "0") == "1"
-TRACE_EVERY_SEC = int(os.getenv("TRACE_EVERY_SEC", "0"))  # 0 disables
+TRACE_EVERY_SEC = int(os.getenv("TRACE_EVERY_SEC", "0"))
 
-# -------- logging --------
 _t0 = time.time()
 def _now():
     return time.strftime("%Y-%m-%d %H:%M:%S")
@@ -52,11 +52,8 @@ def log(msg, *, step=False):
 
 def enable_periodic_traces():
     if TRACE_EVERY_SEC > 0:
-        try:
-            faulthandler.dump_traceback_later(TRACE_EVERY_SEC, repeat=True)
-            log(f"[trace] periodic faulthandler enabled every {TRACE_EVERY_SEC}s")
-        except Exception as e:
-            log(f"[trace] failed to enable periodic traces: {e}")
+        faulthandler.dump_traceback_later(TRACE_EVERY_SEC, repeat=True)
+        log(f"[trace] periodic faulthandler enabled every {TRACE_EVERY_SEC}s")
 
 def enable_usr1_trace():
     try:
@@ -65,7 +62,8 @@ def enable_usr1_trace():
     except Exception as e:
         log(f"[trace] failed to register SIGUSR1 handler: {e}")
 
-# -------------------- utils --------------------
+
+# ------------------------------ utils ------------------------------
 
 def best_threshold_youden(y_true, y_proba):
     fpr, tpr, thr = roc_curve(y_true, y_proba)
@@ -75,13 +73,8 @@ def best_threshold_youden(y_true, y_proba):
 
 def as_str(series: pd.Series) -> pd.Series:
     s = series.astype("object")
-    s = s.fillna("Unknown").astype("object")
-    return s.map(
-        lambda v: "Unknown"
-        if pd.isna(v)
-        else str(int(v)) if isinstance(v, float) and float(v).is_integer()
-        else str(v)
-    )
+    s = s.where(~s.isna(), "Unknown").astype("object")
+    return s.map(lambda v: "Unknown" if pd.isna(v) else str(v))
 
 def reliability_table(y_true, p_pred, n_bins=10):
     y_true = pd.Series(y_true).reset_index(drop=True)
@@ -119,316 +112,335 @@ def plot_reliability(tag, y_true, p_pred, outdir: Path, n_bins=10):
     log(f"[SAVE] reliability plot -> {png_path}")
     log(f"[SAVE] reliability table -> {csv_path}")
 
-def clip01(x):
-    return np.clip(x, 0.0, 1.0)
-
-BIN_KEYS = ["p_lt15", "p_15_30", "p_30_45", "p_45_60", "p_ge60"]
-BIN_HUMAN = {
-    "p_lt15": "< 15 min",
-    "p_15_30": "15–30 min",
-    "p_30_45": "30–45 min",
-    "p_45_60": "45–60 min",
-    "p_ge60": "≥ 60 min",
-}
-
-def make_bins_from_delay(dep_delay_minutes: pd.Series) -> np.ndarray:
-    x = pd.to_numeric(dep_delay_minutes, errors="coerce").fillna(0.0).to_numpy()
-    out = np.zeros(len(x), dtype=int)
-    out[(x >= 15) & (x < 30)] = 1
-    out[(x >= 30) & (x < 45)] = 2
-    out[(x >= 45) & (x < 60)] = 3
-    out[(x >= 60)] = 4
-    return out
-
-def compute_bin_probs(p_ge: Dict[int, np.ndarray]) -> Dict[str, np.ndarray]:
-    # expects keys 15,30,45,60
-    p15 = clip01(p_ge[15])
-    p30 = clip01(p_ge[30])
-    p45 = clip01(p_ge[45])
-    p60 = clip01(p_ge[60])
-
-    # enforce monotone per-row: p15 >= p30 >= p45 >= p60
-    p30 = np.minimum(p30, p15)
-    p45 = np.minimum(p45, p30)
-    p60 = np.minimum(p60, p45)
-
-    out = {}
-    out["p_lt15"]  = clip01(1.0 - p15)
-    out["p_15_30"] = clip01(p15 - p30)
-    out["p_30_45"] = clip01(p30 - p45)
-    out["p_45_60"] = clip01(p45 - p60)
-    out["p_ge60"]  = clip01(p60)
-
-    s = out["p_lt15"] + out["p_15_30"] + out["p_30_45"] + out["p_45_60"] + out["p_ge60"]
-    s = np.where(s <= 0, 1.0, s)
-    for k in out:
-        out[k] = out[k] / s
-    return out
-
-def simple_reason_strings(row: pd.Series, p_ge_row: Dict[int, float], *, max_reasons=3) -> str:
+def enforce_monotone_ge_probs(p_ge: np.ndarray) -> np.ndarray:
     """
-    Small heuristic strings (cheap). You can swap this later for SHAP-based text.
+    p_ge shape = (n, k) for thresholds increasing.
+    Enforce p_ge[:,0] >= p_ge[:,1] >= ... by cumulative min.
     """
+    p = p_ge.copy()
+    for j in range(1, p.shape[1]):
+        p[:, j] = np.minimum(p[:, j], p[:, j-1])
+    return p
+
+def ge_to_bins(p_ge15, p_ge30, p_ge45, p_ge60):
+    # ensure monotone
+    p_ge = enforce_monotone_ge_probs(np.vstack([p_ge15, p_ge30, p_ge45, p_ge60]).T)
+    p15, p30, p45, p60 = p_ge[:, 0], p_ge[:, 1], p_ge[:, 2], p_ge[:, 3]
+
+    p_lt15  = 1.0 - p15
+    p_15_30 = np.maximum(0.0, p15 - p30)
+    p_30_45 = np.maximum(0.0, p30 - p45)
+    p_45_60 = np.maximum(0.0, p45 - p60)
+    p_ge60  = np.maximum(0.0, p60)
+
+    P = np.vstack([p_lt15, p_15_30, p_30_45, p_45_60, p_ge60]).T
+    # renormalize small numeric drift
+    Z = P.sum(axis=1, keepdims=True)
+    Z[Z == 0] = 1.0
+    return P / Z
+
+def true_bin_from_delay(dep_delay_min: pd.Series) -> pd.Series:
+    d = pd.to_numeric(dep_delay_min, errors="coerce").fillna(0.0)
+    bins = pd.cut(
+        d,
+        bins=[-np.inf, 15, 30, 45, 60, np.inf],
+        labels=["< 15 min", "15–30 min", "30–45 min", "45–60 min", "≥ 60 min"],
+        right=False
+    )
+    return bins.astype("object")
+
+def make_reason_row(row) -> str:
     reasons = []
-
-    # flight history support
-    if "flightnum_od_low_support" in row.index and pd.notna(row["flightnum_od_low_support"]):
-        if int(row["flightnum_od_low_support"]) == 1:
+    # simple, controllable heuristics
+    try:
+        if pd.notna(row.get("flightnum_od_low_support")) and int(row["flightnum_od_low_support"]) == 1:
             reasons.append("limited flight-number history")
+    except Exception:
+        pass
 
-    if "flightnum_od_depdelay_mean_lastN" in row.index and pd.notna(row["flightnum_od_depdelay_mean_lastN"]):
-        v = float(row["flightnum_od_depdelay_mean_lastN"])
-        if v >= 20:
+    try:
+        v = row.get("flightnum_od_depdelay_mean_lastN")
+        if pd.notna(v) and float(v) >= 10:
             reasons.append("this flight/route often departs late")
+    except Exception:
+        pass
 
-    # carrier baselines
-    if "carrier_depdelay_mean_lastNdays" in row.index and pd.notna(row["carrier_depdelay_mean_lastNdays"]):
-        v = float(row["carrier_depdelay_mean_lastNdays"])
-        if v >= 15:
+    try:
+        v = row.get("carrier_depdelay_mean_lastNdays")
+        if pd.notna(v) and float(v) >= 10:
             reasons.append("carrier delays elevated recently")
+    except Exception:
+        pass
 
-    if "carrier_origin_depdelay_mean_lastNdays" in row.index and pd.notna(row["carrier_origin_depdelay_mean_lastNdays"]):
-        v = float(row["carrier_origin_depdelay_mean_lastNdays"])
-        if v >= 15:
+    try:
+        v = row.get("carrier_origin_depdelay_mean_lastNdays")
+        if pd.notna(v) and float(v) >= 10:
             reasons.append("origin station running late recently")
+    except Exception:
+        pass
 
-    # weather
-    for wx_col, label in [
-        ("origin_dep_hour_weathercode", "weather near departure"),
-        ("origin_daily_weathercode", "weather that day"),
-    ]:
-        if wx_col in row.index and pd.notna(row[wx_col]):
-            try:
-                code = int(float(row[wx_col]))
-                if code not in (0, 1):
-                    reasons.append(label)
-            except Exception:
-                pass
-
-    # congestion
-    if "origin_congestion_ratio" in row.index and pd.notna(row["origin_congestion_ratio"]):
-        v = float(row["origin_congestion_ratio"])
-        if v >= 2.0:
-            reasons.append("busy gate environment")
-
-    # long-delay tail
-    if p_ge_row.get(60, 0.0) >= 0.25:
-        reasons.append("non-trivial risk of long delay")
+    try:
+        w = row.get("origin_daily_weathercode")
+        if pd.notna(w):
+            reasons.append("weather that day")
+    except Exception:
+        pass
 
     if not reasons:
-        return "Signals are mixed/weak; model leans on small effects."
-    return "; ".join(reasons[:max_reasons])
+        return "no strong delay signals detected"
+    return "; ".join(reasons[:3])
 
-def resolve_features(
-    df: pd.DataFrame,
-    cfg: dict,
-) -> Tuple[List[str], List[str], List[str]]:
-    """
-    Returns (cat_feats, num_feats, dropped_feats).
-    Enforces explicit control.
-    """
-    feats = cfg.get("features", {})
-    cat = list(feats.get("categorical", []))
-    num = list(feats.get("numeric", []))
+def fmt_probs(p_ge15, p_ge30, p_ge45, p_ge60) -> str:
+    # avoid the NaN strings you were seeing: coerce + format
+    def f(x):
+        if x is None or (isinstance(x, float) and np.isnan(x)):
+            return "nan"
+        return f"{float(x):.3f}"
+    return f"P≥15={f(p_ge15)}, P≥30={f(p_ge30)}, P≥45={f(p_ge45)}, P≥60={f(p_ge60)}"
 
-    strict = bool(cfg.get("strict_features", True))
 
-    requested = cat + num
-    missing = [c for c in requested if c not in df.columns]
-    if missing and strict:
-        raise RuntimeError(
-            "Missing requested features (strict_features=true):\n"
-            + "\n".join(f"  - {m}" for m in missing)
-        )
-
-    # drop missing if lenient
-    cat_ok = [c for c in cat if c in df.columns]
-    num_ok = [c for c in num if c in df.columns]
-    dropped = [c for c in requested if c not in (cat_ok + num_ok)]
-
-    return cat_ok, num_ok, dropped
-
-# -------------------- main --------------------
+# ------------------------------ main ------------------------------
 
 def main():
     enable_periodic_traces()
     enable_usr1_trace()
 
-    if len(sys.argv) not in (4,):
-        print("Usage: python src/training/train_dep_bins_ordinal_catboost.py path/to/train_ready_dep.parquet path/to/outdir path/to/config.json")
+    if len(sys.argv) not in (3, 4):
+        print("Usage: python train_dep_bins_ordinal_catboost.py path/to/features_unbalanced.parquet path/to/outdir [path/to/config.json]")
         sys.exit(1)
 
     INPUT = Path(sys.argv[1])
     OUTDIR = Path(sys.argv[2])
-    CFG_PATH = Path(sys.argv[3])
     OUTDIR.mkdir(parents=True, exist_ok=True)
 
-    with open(CFG_PATH, "r") as f:
-        cfg = json.load(f)
+    cfg = {
+        "thresholds": [15, 30, 45, 60],
+        "reliability_bins": 10,
+        "iterations": 4000,
+        "learning_rate": 0.03,
+        "depth": 8,
+        "l2_leaf_reg": 5.0,
+        "od_wait": 200,
+        "random_seed": 42,
 
-    # Defaults (only training knobs; features come only from cfg.features)
-    cfg.setdefault("thresholds", [15, 30, 45, 60])
-    cfg.setdefault("reliability_bins", 10)
-    cfg.setdefault("iterations", 2000)
-    cfg.setdefault("depth", 8)
-    cfg.setdefault("od_wait", 120)
-    cfg.setdefault("random_seed", 42)
-    cfg.setdefault("test_size", 0.20)
-    cfg.setdefault("val_size", 0.20)
-    cfg.setdefault("save_prediction_samples_n", 2000)
-    cfg.setdefault("strict_features", True)
-    cfg.setdefault("fill_numeric_na", "median")  # or "zero"
+        # You control feature list here (explicit, editable)
+        "categorical_features": [
+            "Origin","Dest","od_pair","Reporting_Airline",
+            "dep_dow","sched_dep_hour","is_holiday","aircraft_type",
+            "origin_daily_weathercode","origin_dep_hour_weathercode",
+        ],
+        "numeric_features": [
+            "origin_temp_max_K","origin_temp_min_K","origin_daily_precip_sum_mm",
+            "origin_daily_windspeed_max_kmh",
+            "origin_dep_temp_K","origin_dep_precip_mm","origin_dep_windspeed_kmh",
+            "flightnum_od_depdelay_mean_lastN","flightnum_od_support_count_lastNd",
+            "flightnum_od_low_support",
+            "carrier_depdelay_mean_lastNdays","carrier_origin_depdelay_mean_lastNdays",
+            "turn_time_hours",
+            # NOTE: include origin_congestion_ratio only if you trust it; otherwise omit here.
+        ],
+
+        # Optional: unbalanced eval parquet path (recommended).
+        "eval_features_path": "",
+
+        # Optional: train each threshold on a different balanced features parquet:
+        # {"15": "...parquet", "30": "...parquet", ...}
+        "per_threshold_train_paths": {},
+
+        # If per_threshold_train_paths is not provided, train+calibrate using splits from INPUT.
+        "split": {"test_size": 0.20, "val_size": 0.20},  # val is fraction of remaining after test
+        "max_rows": None,
+    }
+
+    if len(sys.argv) == 4:
+        with open(Path(sys.argv[3]), "r") as f:
+            cfg.update(json.load(f))
 
     if FAST:
-        cfg["iterations"] = min(int(cfg["iterations"]), 900)
-        cfg["depth"] = min(int(cfg["depth"]), 6)
-        cfg["od_wait"] = min(int(cfg["od_wait"]), 80)
-        log("[FAST] Using lighter CatBoost settings")
+        cfg["iterations"] = min(int(cfg.get("iterations", 4000)), 1200)
+        cfg["depth"] = min(int(cfg.get("depth", 8)), 6)
+        cfg["od_wait"] = min(int(cfg.get("od_wait", 200)), 120)
+        cfg["learning_rate"] = max(float(cfg.get("learning_rate", 0.03)), 0.05)
+        log("[FAST] using lighter CatBoost settings")
 
-    THRESHOLDS = list(cfg["thresholds"])
-    REL_BINS = int(cfg["reliability_bins"])
-    SEED = int(cfg["random_seed"])
+    THRESHOLDS = [int(x) for x in cfg.get("thresholds", [15, 30, 45, 60])]
+    REL_BINS = int(cfg.get("reliability_bins", 10))
 
     log(f"Loading data: {INPUT}")
-    df = pd.read_parquet(INPUT)
-    log(f"Rows={len(df)} Cols={len(df.columns)}", step=True)
+    df_all = pd.read_parquet(INPUT)
+    if cfg.get("max_rows"):
+        df_all = df_all.sample(n=int(cfg["max_rows"]), random_state=int(cfg.get("random_seed", 42))).reset_index(drop=True)
+    log(f"Rows={len(df_all)} Cols={len(df_all.columns)}", step=True)
 
-    print("time mean")
-    print(df.groupby("sched_dep_hour")["DepDelayMinutes"].mean())
+    # pick features by intersection (explicit control still comes from config lists)
+    cat_feats = [c for c in cfg["categorical_features"] if c in df_all.columns]
+    num_feats = [c for c in cfg["numeric_features"] if c in df_all.columns]
+    dropped_missing = (len(cfg["categorical_features"]) - len(cat_feats)) + (len(cfg["numeric_features"]) - len(num_feats))
+    log(f"[features] cats={len(cat_feats)} nums={len(num_feats)} dropped_missing={dropped_missing}", step=True)
 
-    print("sparse or not")
-    print(df["flightnum_od_support_count_lastNd"].describe())
-
-    print("low support")
-    print(df["flightnum_od_low_support"].value_counts(normalize=True))
-
-    print("delay mean")
-    print(df["flightnum_od_depdelay_mean_lastN"].describe())
-
-    if "DepDelayMinutes" not in df.columns:
-        raise RuntimeError("DepDelayMinutes missing; dep bin training requires it.")
-
-    cat_feats, num_feats, dropped = resolve_features(df, cfg)
-    log(f"[features] cats={len(cat_feats)} nums={len(num_feats)} dropped_missing={len(dropped)}", step=True)
-    if dropped:
-        log("[features] dropped missing: " + ", ".join(dropped))
-
-    # Save resolved feature list so you can diff runs
-    resolved_path = OUTDIR / "resolved_features.json"
-    with open(resolved_path, "w") as f:
-        json.dump({"categorical": cat_feats, "numeric": num_feats, "dropped_missing": dropped}, f, indent=2)
-    log(f"[SAVE] resolved features -> {resolved_path}")
-
-    # Build X
-    X = df[cat_feats + num_feats].copy()
-    for c in cat_feats:
-        X[c] = as_str(X[c])
-    for c in num_feats:
-        X[c] = pd.to_numeric(X[c], errors="coerce")
-        if X[c].isna().any():
-            if cfg["fill_numeric_na"] == "zero":
-                X[c] = X[c].fillna(0.0)
-            else:
-                X[c] = X[c].fillna(X[c].median())
-
-    dep = pd.to_numeric(df["DepDelayMinutes"], errors="coerce").fillna(0.0)
-    base_y = (dep >= 15).astype(int).values
-
-    all_idx = np.arange(len(X))
-    test_size = float(cfg["test_size"])
-    val_size = float(cfg["val_size"])
-    temp_size = test_size + val_size
-    if not (0 < temp_size < 1):
-        raise RuntimeError("test_size + val_size must be in (0,1).")
-
-    log("[split] stratified splits on dep>=15", step=True)
-    idx_train, idx_temp, y_train_base, y_temp_base = train_test_split(
-        all_idx, base_y, test_size=temp_size, random_state=SEED, stratify=base_y
+    # resolved feature list artifact
+    (OUTDIR / "resolved_features.json").write_text(
+        json.dumps({"categorical": cat_feats, "numeric": num_feats}, indent=2)
     )
-    rel_test = test_size / temp_size
-    idx_val, idx_test, y_val_base, y_test_base = train_test_split(
-        idx_temp, y_temp_base, test_size=rel_test, random_state=SEED, stratify=y_temp_base
-    )
-    log(f"[split] sizes train={len(idx_train)} val={len(idx_val)} test={len(idx_test)}")
+    log(f"[SAVE] resolved features -> {OUTDIR / 'resolved_features.json'}")
 
-    cat_idx = [X.columns.get_loc(c) for c in cat_feats]
-    X_train = X.iloc[idx_train]
-    X_val   = X.iloc[idx_val]
-    X_test  = X.iloc[idx_test]
+    def build_X(df: pd.DataFrame) -> pd.DataFrame:
+        X = df[cat_feats + num_feats].copy()
+        for c in cat_feats:
+            X[c] = as_str(X[c])
+        for c in num_feats:
+            X[c] = pd.to_numeric(X[c], errors="coerce")
+            if X[c].isna().any():
+                med = X[c].median()
+                X[c] = X[c].fillna(med if pd.notna(med) else 0.0)
+        return X
+
+    def make_y(df: pd.DataFrame, thr: int) -> np.ndarray:
+        # prefer precomputed label if present
+        col = f"y_dep_ge{thr}"
+        if col in df.columns:
+            return df[col].astype(int).values
+        d = pd.to_numeric(df.get("DepDelayMinutes"), errors="coerce").fillna(0.0)
+        return (d >= int(thr)).astype(int).values
+
+    # evaluation dataset (unbalanced) if provided
+    eval_path = cfg.get("eval_features_path") or ""
+    df_eval = pd.read_parquet(eval_path) if eval_path else None
+    if df_eval is not None:
+        log(f"[eval] using unbalanced eval parquet: {eval_path} rows={len(df_eval)}")
+
+    # train sources per-threshold
+    per_thr_paths = cfg.get("per_threshold_train_paths") or {}
+    per_thr_paths = {str(k): str(v) for k, v in per_thr_paths.items()}
+
+    # If no per-threshold train paths, we do a single split from df_all
+    if not per_thr_paths:
+        # stratify on >=15 if possible
+        base_y = make_y(df_all, 15)
+        idx = np.arange(len(df_all))
+        test_size = float(cfg.get("split", {}).get("test_size", 0.20))
+        val_size = float(cfg.get("split", {}).get("val_size", 0.20))
+
+        log("[split] stratified splits on dep>=15", step=True)
+        idx_train, idx_test, _, _ = train_test_split(
+            idx, base_y, test_size=test_size, random_state=int(cfg.get("random_seed", 42)), stratify=base_y
+        )
+        # val fraction of remaining train
+        rel_val = val_size / max(1e-9, (1.0 - test_size))
+        idx_train, idx_val, _, _ = train_test_split(
+            idx_train, base_y[idx_train], test_size=rel_val, random_state=int(cfg.get("random_seed", 42)), stratify=base_y[idx_train]
+        )
+        log(f"[split] sizes train={len(idx_train)} val={len(idx_val)} test={len(idx_test)}")
+
+        df_train_base = df_all.iloc[idx_train].reset_index(drop=True)
+        df_val_base   = df_all.iloc[idx_val].reset_index(drop=True)
+        df_test_base  = df_all.iloc[idx_test].reset_index(drop=True)
+    else:
+        df_train_base = df_val_base = df_test_base = None  # unused
 
     registry = {}
-    p_ge_val: Dict[int, np.ndarray] = {}
-    p_ge_test: Dict[int, np.ndarray] = {}
+    cat_idx = [i for i, c in enumerate(cat_feats)]  # column indices in X
 
     for thr in THRESHOLDS:
         log("="*18 + f" Train dep >= {thr} " + "="*18, step=True)
         thr_dir = OUTDIR / f"thr_{thr}"
         thr_dir.mkdir(parents=True, exist_ok=True)
 
-        y_all = (dep >= thr).astype(int).values
-        y_train = y_all[idx_train]
-        y_val_y = y_all[idx_val]
-        y_test_y = y_all[idx_test]
+        # choose train set
+        if per_thr_paths:
+            p = per_thr_paths.get(str(thr))
+            if not p:
+                raise ValueError(f"per_threshold_train_paths missing threshold {thr}")
+            df_tr = pd.read_parquet(p)
+            # make splits inside this per-threshold training parquet
+            base_y = make_y(df_tr, thr)
+            idx = np.arange(len(df_tr))
+            idx_train, idx_temp, _, _ = train_test_split(
+                idx, base_y, test_size=0.40, random_state=int(cfg.get("random_seed", 42)), stratify=base_y
+            )
+            idx_val, idx_test, _, _ = train_test_split(
+                idx_temp, base_y[idx_temp], test_size=0.50, random_state=int(cfg.get("random_seed", 42)), stratify=base_y[idx_temp]
+            )
+            df_train = df_tr.iloc[idx_train].reset_index(drop=True)
+            df_val   = df_tr.iloc[idx_val].reset_index(drop=True)
+            df_test  = df_tr.iloc[idx_test].reset_index(drop=True)
+
+            log(f"[data] per-threshold train={p} sizes train={len(df_train)} val={len(df_val)} test={len(df_test)}")
+        else:
+            df_train, df_val, df_test = df_train_base, df_val_base, df_test_base
+
+        X_train = build_X(df_train)
+        X_val   = build_X(df_val)
+        X_test  = build_X(df_test)
+        y_train = make_y(df_train, thr)
+        y_val   = make_y(df_val, thr)
+        y_test  = make_y(df_test, thr)
 
         train_pool = Pool(X_train, y_train, cat_features=cat_idx)
-        val_pool   = Pool(X_val,   y_val_y, cat_features=cat_idx)
+        val_pool   = Pool(X_val,   y_val,   cat_features=cat_idx)
 
+        iters = int(cfg.get("iterations", 4000))
+        depth = int(cfg.get("depth", 8))
+        lr = float(cfg.get("learning_rate", 0.03))
+        l2 = float(cfg.get("l2_leaf_reg", 5.0))
+        od_wait = int(cfg.get("od_wait", 200))
+
+        log(f"[cb] fit start (iter={iters} depth={depth} lr={lr} l2={l2} od_wait={od_wait})")
         clf = CatBoostClassifier(
             loss_function="Logloss",
             eval_metric="AUC",
-            learning_rate=0.05,
-            depth=int(cfg["depth"]),
-            l2_leaf_reg=3.0,
-            iterations=int(cfg["iterations"]),
-            random_seed=SEED,
+            learning_rate=lr,
+            depth=depth,
+            l2_leaf_reg=l2,
+            iterations=iters,
+            random_seed=int(cfg.get("random_seed", 42)),
             verbose=200,
             od_type="Iter",
-            od_wait=int(cfg["od_wait"]),
+            od_wait=od_wait,
             thread_count=-1,
         )
-
-        log("[cb] fit start")
         clf.fit(train_pool, eval_set=val_pool, use_best_model=True)
         log("[cb] fit done")
 
-        log("[cal] isotonic calibration (val) start")
+        log("[cal] isotonic calibration (val)")
         calibrator = CalibratedClassifierCV(estimator=clf, cv="prefit", method="isotonic")
-        calibrator.fit(X_val, y_val_y)
+        calibrator.fit(X_val, y_val)
         log("[cal] done")
 
-        val_p = calibrator.predict_proba(X_val)[:, 1]
-        test_p = calibrator.predict_proba(X_test)[:, 1]
+        # eval
+        val_proba = calibrator.predict_proba(X_val)[:, 1]
+        th, tpr, fpr = best_threshold_youden(y_val, val_proba)
+        test_proba = calibrator.predict_proba(X_test)[:, 1]
+        y_pred = (test_proba >= th).astype(int)
 
-        th, tpr, fpr = best_threshold_youden(y_val_y, val_p)
         log(f"[thr≥{thr}] Youden threshold={th:.3f} | TPR={tpr:.3f} FPR={fpr:.3f}")
-        log(f"[thr≥{thr}] AUC val={roc_auc_score(y_val_y, val_p):.3f}  AUC test={roc_auc_score(y_test_y, test_p):.3f}")
+        log(f"[thr≥{thr}] AUC val={roc_auc_score(y_val, val_proba):.3f}  AUC test={roc_auc_score(y_test, test_proba):.3f}")
 
-        y_pred_test = (test_p >= th).astype(int)
-        print(f"[thr≥{thr}] Classification report @ Youden:")
-        print(classification_report(y_test_y, y_pred_test), flush=True)
-        print(f"[thr≥{thr}] Confusion matrix:\n{confusion_matrix(y_test_y, y_pred_test)}", flush=True)
+        print(f"[thr≥{thr}] Classification report @ Youden:", flush=True)
+        print(classification_report(y_test, y_pred), flush=True)
+        print(f"[thr≥{thr}] Confusion matrix:\n{confusion_matrix(y_test, y_pred)}", flush=True)
 
+        # reliability plots (test split of training set)
         if not NO_PLOTS:
             try:
-                plot_reliability(f"dep_ge{thr}_test", y_test_y, test_p, thr_dir, n_bins=REL_BINS)
+                plot_reliability(f"dep_ge{thr}_test", y_test, test_proba, thr_dir, n_bins=REL_BINS)
             except Exception as e:
                 log(f"[plot][WARN] reliability failed: {e}")
 
+        # save artifacts
         cat_model_path = thr_dir / f"catboost_dep_ge{thr}.cbm"
         clf.save_model(str(cat_model_path))
-        cal_path = thr_dir / f"calibrated_dep_ge{thr}.joblib"
-        joblib.dump(calibrator, cal_path)
+        joblib.dump(calibrator, thr_dir / f"calibrated_dep_ge{thr}.joblib")
 
         meta = {
-            "target": "dep",
             "threshold": thr,
             "threshold_youden": th,
             "tpr_at_threshold": tpr,
             "fpr_at_threshold": fpr,
             "categorical_features": cat_feats,
             "numeric_features": num_feats,
-            "input_parquet": str(INPUT),
-            "config_path": str(CFG_PATH),
+            "input_features_parquet": str(INPUT),
+            "train_source": per_thr_paths.get(str(thr), str(INPUT)),
             "config_used": cfg,
         }
         with open(thr_dir / "meta.json", "w") as f:
@@ -436,108 +448,84 @@ def main():
 
         registry[thr] = {
             "model_path": str(cat_model_path),
-            "cal_path": str(cal_path),
-            "youden_threshold": th,
+            "cal_path": str(thr_dir / f"calibrated_dep_ge{thr}.joblib"),
         }
 
-        p_ge_val[thr] = val_p
-        p_ge_test[thr] = test_p
+    # ------------------------------
+    # Bin distribution evaluation + prediction samples (on unbalanced eval if provided)
+    # ------------------------------
+    if df_eval is None:
+        # fall back to INPUT test split if no eval parquet provided
+        df_eval = df_all.copy()
 
-    # Convert to bin probabilities
-    probs_val = compute_bin_probs(p_ge_val)
-    probs_test = compute_bin_probs(p_ge_test)
+    X_eval = build_X(df_eval)
+    dep_delay = pd.to_numeric(df_eval.get("DepDelayMinutes"), errors="coerce").fillna(0.0)
+    df_eval = df_eval.copy()
+    df_eval["true_bin"] = true_bin_from_delay(dep_delay)
 
-    y_bin_all = make_bins_from_delay(dep)
-    y_bin_val  = y_bin_all[idx_val]
-    y_bin_test = y_bin_all[idx_test]
+    # load calibrators and compute p_ge for eval
+    p_ge = {}
+    for thr in THRESHOLDS:
+        cal = joblib.load(registry[thr]["cal_path"])
+        p_ge[thr] = cal.predict_proba(X_eval)[:, 1].astype(float)
 
-    P_val  = np.vstack([probs_val[k] for k in BIN_KEYS]).T
-    P_test = np.vstack([probs_test[k] for k in BIN_KEYS]).T
+    # bin probabilities
+    P = ge_to_bins(p_ge[15], p_ge[30], p_ge[45], p_ge[60])
+    bin_labels = ["< 15 min", "15–30 min", "30–45 min", "45–60 min", "≥ 60 min"]
+    pred_idx = np.argmax(P, axis=1)
+    df_eval["pred_bin"] = pd.Series([bin_labels[i] for i in pred_idx], index=df_eval.index)
 
-    ll_val  = log_loss(y_bin_val,  P_val,  labels=list(range(5)))
-    ll_test = log_loss(y_bin_test, P_test, labels=list(range(5)))
-    acc_test = (np.argmax(P_test, axis=1) == y_bin_test).mean()
+    # eval metrics
+    y_true_mc = pd.Categorical(df_eval["true_bin"], categories=bin_labels, ordered=True).codes
+    y_pred_mc = pred_idx
+    try:
+        ll = log_loss(y_true_mc, P, labels=list(range(len(bin_labels))))
+    except Exception:
+        ll = float("nan")
+    acc = accuracy_score(y_true_mc, y_pred_mc)
+    log(f"[BINS] eval logloss={ll:.4f}  acc={acc:.4f}")
 
-    log(f"[BINS] val logloss={ll_val:.4f}")
-    log(f"[BINS] test logloss={ll_test:.4f}  acc={acc_test:.4f}", step=True)
+    # explanations / probability strings
+    df_eval["reason"] = df_eval.apply(make_reason_row, axis=1)
+    df_eval["p_lt15"]  = P[:, 0]
+    df_eval["p_15_30"] = P[:, 1]
+    df_eval["p_30_45"] = P[:, 2]
+    df_eval["p_45_60"] = P[:, 3]
+    df_eval["p_ge60"]  = P[:, 4]
+    df_eval["p_ge15"] = p_ge[15]
+    df_eval["p_ge30"] = p_ge[30]
+    df_eval["p_ge45"] = p_ge[45]
+    df_eval["p_ge60_raw"] = p_ge[60]  # raw p>=60 before bin conversion
 
-    # Save registry
+    df_eval["predicted_delay_bin"] = df_eval["pred_bin"]
+    df_eval["delay_explanation"] = df_eval["reason"]
+    df_eval["delay_probabilities"] = [
+        fmt_probs(a, b, c, d) for a, b, c, d in zip(df_eval["p_ge15"], df_eval["p_ge30"], df_eval["p_ge45"], df_eval["p_ge60_raw"])
+    ]
+
+    # save samples
+    sample_n = int(cfg.get("prediction_samples_n", 500))
+    sample = df_eval.sample(n=min(sample_n, len(df_eval)), random_state=int(cfg.get("random_seed", 42))).reset_index(drop=True)
+    sample_path = OUTDIR / "prediction_samples.parquet"
+    sample.to_parquet(sample_path, index=False)
+    log(f"[SAVE] prediction samples -> {sample_path}")
+
     with open(OUTDIR / "registry.json", "w") as f:
         json.dump(registry, f, indent=2)
     log(f"[SAVE] registry -> {OUTDIR / 'registry.json'}")
 
-    # Save sample predictions + reasons
-    n_samp = min(int(cfg["save_prediction_samples_n"]), len(idx_test))
-    rs = np.random.RandomState(SEED)
-    samp_idx = rs.choice(idx_test, size=n_samp, replace=False)
-
-    test_index_to_pos = {int(ix): pos for pos, ix in enumerate(idx_test)}
-
-    rows = []
-    for ix in samp_idx:
-        row = df.iloc[int(ix)]
-        pos = test_index_to_pos[int(ix)]
-        p_ge_row = {thr: float(p_ge_test[thr][pos]) for thr in THRESHOLDS}
-
-        # per-row bin probs with monotone enforcement
-        p15 = clip01(p_ge_row[15])
-        p30 = min(clip01(p_ge_row[30]), p15)
-        p45 = min(clip01(p_ge_row[45]), p30)
-        p60 = min(clip01(p_ge_row[60]), p45)
-        pb = {
-            "p_lt15":  float(clip01(1 - p15)),
-            "p_15_30": float(clip01(p15 - p30)),
-            "p_30_45": float(clip01(p30 - p45)),
-            "p_45_60": float(clip01(p45 - p60)),
-            "p_ge60":  float(clip01(p60)),
-        }
-        s = sum(pb.values()) or 1.0
-        for k in pb:
-            pb[k] /= s
-
-        pred_key = max(pb, key=lambda k: pb[k])
-        reason = simple_reason_strings(row, p_ge_row)
-
-        rows.append({
-            "Origin": row.get("Origin"),
-            "Dest": row.get("Dest"),
-            "Reporting_Airline": row.get("Reporting_Airline"),
-            "FlightDate": str(row.get("FlightDate")),
-            "DepDelayMinutes": float(pd.to_numeric(row.get("DepDelayMinutes"), errors="coerce") or 0.0),
-            "true_bin": BIN_HUMAN[BIN_KEYS[y_bin_all[int(ix)]]],
-            "pred_bin": BIN_HUMAN[pred_key],
-            "reason": reason,
-            **pb,
-            "p_ge15": float(p15),
-            "p_ge30": float(p30),
-            "p_ge45": float(p45),
-            "p_ge60": float(p60),
-        })
-
-    sample_df = pd.DataFrame(rows)
-    sample_path = OUTDIR / "prediction_samples.parquet"
-    sample_df.to_parquet(sample_path, index=False)
-    log(f"[SAVE] prediction samples -> {sample_path}")
-
     bins_meta = {
-        "bin_keys": BIN_KEYS,
-        "bin_human": BIN_HUMAN,
-        "construction": {
-            "p_lt15": "1 - p_ge15",
-            "p_15_30": "p_ge15 - p_ge30",
-            "p_30_45": "p_ge30 - p_ge45",
-            "p_45_60": "p_ge45 - p_ge60",
-            "p_ge60": "p_ge60",
-            "monotone_enforced": True,
-            "renormalized": True
-        }
+        "bin_labels": bin_labels,
+        "thresholds": THRESHOLDS,
+        "eval_logloss": ll,
+        "eval_acc": acc,
+        "eval_features_path": str(cfg.get("eval_features_path") or ""),
     }
     with open(OUTDIR / "bins_meta.json", "w") as f:
         json.dump(bins_meta, f, indent=2)
     log(f"[SAVE] bins meta -> {OUTDIR / 'bins_meta.json'}")
 
     log("[OK] finished training dep bin distribution models")
-
 
 if __name__ == "__main__":
     main()

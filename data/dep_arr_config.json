@@ -1,32 +1,68 @@
 {
-  "input_flights_path": ["data/raw_bts/Year=2023/Month=*/flights.parquet","data/raw_bts/Year=2024/Month=*/flights.parquet"],
-  "start_date": "2023-3-01",
-  "end_date": "2024-12-31",
-
-  "airlines": ["WN"],
-  "airports": ["DEN","MDW","DAL","PHX","LAS","BWI","HOU","OAK","LAX","SAN","SJC","SMF","ONT","BUR","SNA","LGB","PDX","SEA","SLC","PHX","TUS","ABQ","ELP","AUS","SAT","DFW","IAH","MSY","BNA","ATL","MCO","TPA","FLL","MIA","PBI","JAX","RSW","RDU","CLT","ORF","RIC","CMH","CLE","DTW","MSP","STL","MCI","OKC","ICT"],
-
   "target": "dep",
-  "label_type": "binary_15",
-  "balance": { "enabled": true, "seed": 42, "max_rows": 40000 },
 
-  "weather": { "daily": true, "hourly": true, "cache_dir": "data/weather_cache" },
+  "input_flights_path": [
+    "data/raw_bts/Year=2023/Month=*/flights.parquet",
+    "data/raw_bts/Year=2024/Month=*/flights.parquet",
+    "data/raw_bts/Year=2025/Month=*/flights.parquet"
+  ],
 
-  "features_dep": {
-    "n_recent_flightnum_od": 10,
-    "n_days_carrier_network": 7,
-    "n_days_carrier_origin": 7,
-    "holiday_windows": { "thanksgiving": 2, "christmas": 3 }
+  "airports_csv": "data/meta/airports.csv",
+  "airports": ["DEN","MDW","DAL","PHX","LAS","BWI","HOU","OAK","LAX","SAN","SJC","SMF","ONT","BUR","SNA","LGB","PDX","SEA","SLC","PHX","TUS","ABQ","ELP","AUS","SAT","DFW","IAH","MSY","BNA","ATL","MCO","TPA","FLL","MIA","PBI","JAX","RSW","RDU","CLT","ORF","RIC","CMH","CLE","DTW","MSP","STL","MCI","OKC","ICT"],
+  "airlines": ["WN"],
+
+  "start_date": "2023-03-01",
+  "end_date": "2025-06-30",
+
+  "weather": {
+    "cache_dir": "data/weather_cache",
+    "daily": true
   },
 
-  "airport_json": "data/airport_coords.json",
-  "airport_gates_csv": "",
+  "add_aircraft_age": true,
   "aircraft_registry_csv": "data/aircraft_registry_clean.csv",
-  "airports_csv": "data/meta/airports.csv",
 
-  "output_intermediate_path": "data/intermediate/WN_50_23-25.parquet",
-  "output_training_path": "data/processed/WN_50_23-25.parquet",
+  "output_enriched_unbalanced_path": "data/intermediate/WN_50_23-25_unbalanced.parquet",
 
-  "single_airline": null,
-  "history_min_support": 2
+  "history_flights_path": [
+    "data/raw_bts/Year=2023/Month=*/flights.parquet",
+    "data/raw_bts/Year=2024/Month=*/flights.parquet",
+    "data/raw_bts/Year=2025/Month=*/flights.parquet"
+  ],
+  "history_lookback_days": 60,
+  "history_output_path": "data/intermediate/history_pool_dep_WN_50_23-25.parquet",
+
+  "features_dep": {
+    "holiday_windows": { "thanksgiving": 2, "christmas": 3 },
+
+    "n_recent_flightnum_od": 20,
+    "n_days_flightnum_od": 14,
+    "low_support_leq": 2,
+
+    "n_days_carrier_network": 14
+  },
+
+  "output_features_unbalanced_path": "data/processed/features_dep_WN_50_23-25_unbalanced.parquet",
+
+  "balance": {
+    "thresholds": [15, 30, 45, 60],
+    "delay_col": "DepDelayMinutes"
+  },
+
+  "feature_balance": {
+    "enabled": true,
+
+    "eval": {
+      "enabled": true,
+      "by": "last_days",
+      "last_days": 90,
+      "output_path": "data/processed/features_dep_WN_50_23-25_eval_unbalanced.parquet"
+    },
+
+    "thresholds": [15, 30, 45, 60],
+    "pos_frac": 0.50,
+    "seed": 42,
+    "max_rows": 200000,
+    "output_template": "data/processed/train_dep_ge{thr}_balanced_WN_50_23-25.parquet"
+  }
 }
