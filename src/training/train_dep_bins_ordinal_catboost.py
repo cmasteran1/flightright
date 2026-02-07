@@ -12,7 +12,10 @@
 # Notes:
 # - You can train each threshold on its OWN balanced feature parquet (recommended) by
 #   setting cfg["per_threshold_train_paths"].
-# - Evaluation/calibration can be done on an unbalanced eval parquet (recommended).
+# - Calibration/evaluation can be done on an unbalanced eval parquet (recommended):
+#     cfg["eval_features_path"] = "..._eval_unbalanced.parquet"
+# - This version fits calibrators on an UNBALANCED calibration split derived from
+#   cfg["eval_features_path"] when provided.
 #
 import os, sys, json, time, signal, faulthandler
 from pathlib import Path
@@ -21,7 +24,10 @@ import numpy as np
 import pandas as pd
 
 from sklearn.model_selection import train_test_split
-from sklearn.metrics import classification_report, confusion_matrix, roc_auc_score, roc_curve, log_loss, accuracy_score
+from sklearn.metrics import (
+    classification_report, confusion_matrix,
+    roc_auc_score, roc_curve, log_loss, accuracy_score
+)
 from sklearn.calibration import CalibratedClassifierCV
 import joblib
 
@@ -198,6 +204,31 @@ def fmt_probs(p_ge15, p_ge30, p_ge45, p_ge60) -> str:
         return f"{float(x):.3f}"
     return f"P≥15={f(p_ge15)}, P≥30={f(p_ge30)}, P≥45={f(p_ge45)}, P≥60={f(p_ge60)}"
 
+def _split_unbalanced_for_cal_and_eval(df_unbal: pd.DataFrame, *, cal_size: float, seed: int):
+    """
+    Split an unbalanced dataframe into (calibration, eval) without forcing class balance.
+    We stratify on y>=15 only to keep both classes present in smaller samples.
+    """
+    if len(df_unbal) < 20:
+        return df_unbal.copy(), df_unbal.copy()
+
+    d = pd.to_numeric(df_unbal.get("DepDelayMinutes"), errors="coerce").fillna(0.0)
+    y15 = (d >= 15).astype(int).values
+    idx = np.arange(len(df_unbal))
+
+    cal_size = float(cal_size)
+    cal_size = min(max(cal_size, 0.05), 0.95)
+
+    idx_cal, idx_eval, _, _ = train_test_split(
+        idx, y15,
+        test_size=(1.0 - cal_size),
+        random_state=int(seed),
+        stratify=y15
+    )
+    df_cal = df_unbal.iloc[idx_cal].reset_index(drop=True)
+    df_eval = df_unbal.iloc[idx_eval].reset_index(drop=True)
+    return df_cal, df_eval
+
 
 # ------------------------------ main ------------------------------
 
@@ -237,18 +268,25 @@ def main():
             "flightnum_od_low_support",
             "carrier_depdelay_mean_lastNdays","carrier_origin_depdelay_mean_lastNdays",
             "turn_time_hours",
-            # NOTE: include origin_congestion_ratio only if you trust it; otherwise omit here.
         ],
 
-        # Optional: unbalanced eval parquet path (recommended).
+        # Unbalanced eval parquet path (recommended). We'll split it into:
+        #   - unbalanced calibration (fit isotonic here)
+        #   - unbalanced evaluation (compute bins here)
         "eval_features_path": "",
 
         # Optional: train each threshold on a different balanced features parquet:
         # {"15": "...parquet", "30": "...parquet", ...}
         "per_threshold_train_paths": {},
 
-        # If per_threshold_train_paths is not provided, train+calibrate using splits from INPUT.
-        "split": {"test_size": 0.20, "val_size": 0.20},  # val is fraction of remaining after test
+        # For per-threshold training, we still split balanced parquet into
+        # train / early-stop / balanced sanity test.
+        "split": {"test_size": 0.20, "val_size": 0.20},  # used only when per_threshold_train_paths is NOT provided
+
+        # Fraction of the unbalanced eval parquet used for calibration.
+        # Remaining fraction used for unbalanced evaluation.
+        "unbalanced_cal_size": 0.50,
+
         "max_rows": None,
     }
 
@@ -265,11 +303,12 @@ def main():
 
     THRESHOLDS = [int(x) for x in cfg.get("thresholds", [15, 30, 45, 60])]
     REL_BINS = int(cfg.get("reliability_bins", 10))
+    SEED = int(cfg.get("random_seed", 42))
 
     log(f"Loading data: {INPUT}")
     df_all = pd.read_parquet(INPUT)
     if cfg.get("max_rows"):
-        df_all = df_all.sample(n=int(cfg["max_rows"]), random_state=int(cfg.get("random_seed", 42))).reset_index(drop=True)
+        df_all = df_all.sample(n=int(cfg["max_rows"]), random_state=SEED).reset_index(drop=True)
     log(f"Rows={len(df_all)} Cols={len(df_all.columns)}", step=True)
 
     # pick features by intersection (explicit control still comes from config lists)
@@ -296,18 +335,27 @@ def main():
         return X
 
     def make_y(df: pd.DataFrame, thr: int) -> np.ndarray:
-        # prefer precomputed label if present
         col = f"y_dep_ge{thr}"
         if col in df.columns:
             return df[col].astype(int).values
         d = pd.to_numeric(df.get("DepDelayMinutes"), errors="coerce").fillna(0.0)
         return (d >= int(thr)).astype(int).values
 
-    # evaluation dataset (unbalanced) if provided
-    eval_path = cfg.get("eval_features_path") or ""
-    df_eval = pd.read_parquet(eval_path) if eval_path else None
-    if df_eval is not None:
-        log(f"[eval] using unbalanced eval parquet: {eval_path} rows={len(df_eval)}")
+    # ------------------------------
+    # Unbalanced calibration + unbalanced evaluation source:
+    # USE cfg["eval_features_path"] (your JSON already has it)
+    # ------------------------------
+    eval_path = str(cfg.get("eval_features_path") or "").strip()
+    if not eval_path:
+        raise ValueError("cfg['eval_features_path'] must be set to an unbalanced parquet for calibration/eval.")
+
+    df_unbal = pd.read_parquet(eval_path)
+    log(f"[unbalanced] loaded eval_features_path={eval_path} rows={len(df_unbal)}", step=True)
+
+    cal_frac = float(cfg.get("unbalanced_cal_size", 0.50))
+    df_cal_unbal, df_eval_unbal = _split_unbalanced_for_cal_and_eval(df_unbal, cal_size=cal_frac, seed=SEED)
+    unbal_source = f"eval_features_path:{eval_path}"
+    log(f"[unbalanced] split -> cal={len(df_cal_unbal)} eval={len(df_eval_unbal)} (cal_size={cal_frac:.2f})", step=True)
 
     # train sources per-threshold
     per_thr_paths = cfg.get("per_threshold_train_paths") or {}
@@ -315,28 +363,26 @@ def main():
 
     # If no per-threshold train paths, we do a single split from df_all
     if not per_thr_paths:
-        # stratify on >=15 if possible
         base_y = make_y(df_all, 15)
         idx = np.arange(len(df_all))
         test_size = float(cfg.get("split", {}).get("test_size", 0.20))
         val_size = float(cfg.get("split", {}).get("val_size", 0.20))
 
-        log("[split] stratified splits on dep>=15", step=True)
+        log("[split] stratified splits on dep>=15 (single INPUT mode)", step=True)
         idx_train, idx_test, _, _ = train_test_split(
-            idx, base_y, test_size=test_size, random_state=int(cfg.get("random_seed", 42)), stratify=base_y
+            idx, base_y, test_size=test_size, random_state=SEED, stratify=base_y
         )
-        # val fraction of remaining train
         rel_val = val_size / max(1e-9, (1.0 - test_size))
         idx_train, idx_val, _, _ = train_test_split(
-            idx_train, base_y[idx_train], test_size=rel_val, random_state=int(cfg.get("random_seed", 42)), stratify=base_y[idx_train]
+            idx_train, base_y[idx_train], test_size=rel_val, random_state=SEED, stratify=base_y[idx_train]
         )
         log(f"[split] sizes train={len(idx_train)} val={len(idx_val)} test={len(idx_test)}")
 
         df_train_base = df_all.iloc[idx_train].reset_index(drop=True)
-        df_val_base   = df_all.iloc[idx_val].reset_index(drop=True)
-        df_test_base  = df_all.iloc[idx_test].reset_index(drop=True)
+        df_es_val     = df_all.iloc[idx_val].reset_index(drop=True)   # early stopping
+        df_test_base  = df_all.iloc[idx_test].reset_index(drop=True)  # balanced-ish sanity
     else:
-        df_train_base = df_val_base = df_test_base = None  # unused
+        df_train_base = df_es_val = df_test_base = None  # unused
 
     registry = {}
     cat_idx = [i for i, c in enumerate(cat_feats)]  # column indices in X
@@ -352,32 +398,46 @@ def main():
             if not p:
                 raise ValueError(f"per_threshold_train_paths missing threshold {thr}")
             df_tr = pd.read_parquet(p)
-            # make splits inside this per-threshold training parquet
+
             base_y = make_y(df_tr, thr)
             idx = np.arange(len(df_tr))
-            idx_train, idx_temp, _, _ = train_test_split(
-                idx, base_y, test_size=0.40, random_state=int(cfg.get("random_seed", 42)), stratify=base_y
-            )
-            idx_val, idx_test, _, _ = train_test_split(
-                idx_temp, base_y[idx_temp], test_size=0.50, random_state=int(cfg.get("random_seed", 42)), stratify=base_y[idx_temp]
-            )
-            df_train = df_tr.iloc[idx_train].reset_index(drop=True)
-            df_val   = df_tr.iloc[idx_val].reset_index(drop=True)
-            df_test  = df_tr.iloc[idx_test].reset_index(drop=True)
 
-            log(f"[data] per-threshold train={p} sizes train={len(df_train)} val={len(df_val)} test={len(df_test)}")
+            idx_train, idx_temp, _, _ = train_test_split(
+                idx, base_y, test_size=0.40, random_state=SEED, stratify=base_y
+            )
+            idx_es, idx_test, _, _ = train_test_split(
+                idx_temp, base_y[idx_temp], test_size=0.50, random_state=SEED, stratify=base_y[idx_temp]
+            )
+
+            df_train = df_tr.iloc[idx_train].reset_index(drop=True)
+            df_es    = df_tr.iloc[idx_es].reset_index(drop=True)     # early stopping
+            df_test  = df_tr.iloc[idx_test].reset_index(drop=True)   # balanced sanity test
+
+            log(f"[data] per-threshold train={p} sizes train={len(df_train)} earlystop={len(df_es)} test={len(df_test)}")
         else:
-            df_train, df_val, df_test = df_train_base, df_val_base, df_test_base
+            df_train, df_es, df_test = df_train_base, df_es_val, df_test_base
+
+        # Unbalanced calibration/eval are shared across thresholds (labels differ per thr)
+        df_cal_thr  = df_cal_unbal
+        df_eval_thr = df_eval_unbal
 
         X_train = build_X(df_train)
-        X_val   = build_X(df_val)
-        X_test  = build_X(df_test)
         y_train = make_y(df_train, thr)
-        y_val   = make_y(df_val, thr)
-        y_test  = make_y(df_test, thr)
+
+        X_es = build_X(df_es)
+        y_es = make_y(df_es, thr)
+
+        X_test_bal = build_X(df_test)
+        y_test_bal = make_y(df_test, thr)
+
+        X_cal = build_X(df_cal_thr)
+        y_cal = make_y(df_cal_thr, thr)
+
+        X_eval = build_X(df_eval_thr)
+        y_eval = make_y(df_eval_thr, thr)
 
         train_pool = Pool(X_train, y_train, cat_features=cat_idx)
-        val_pool   = Pool(X_val,   y_val,   cat_features=cat_idx)
+        es_pool    = Pool(X_es,    y_es,    cat_features=cat_idx)
 
         iters = int(cfg.get("iterations", 4000))
         depth = int(cfg.get("depth", 8))
@@ -393,39 +453,56 @@ def main():
             depth=depth,
             l2_leaf_reg=l2,
             iterations=iters,
-            random_seed=int(cfg.get("random_seed", 42)),
+            random_seed=SEED,
             verbose=200,
             od_type="Iter",
             od_wait=od_wait,
             thread_count=-1,
         )
-        clf.fit(train_pool, eval_set=val_pool, use_best_model=True)
+        clf.fit(train_pool, eval_set=es_pool, use_best_model=True)
         log("[cb] fit done")
 
-        log("[cal] isotonic calibration (val)")
+        # CALIBRATE ON UNBALANCED CAL SPLIT (from eval_features_path)
+        log(f"[cal] isotonic calibration on UNBALANCED cal split (source={unbal_source}) size={len(df_cal_thr)}")
         calibrator = CalibratedClassifierCV(estimator=clf, cv="prefit", method="isotonic")
-        calibrator.fit(X_val, y_val)
+        calibrator.fit(X_cal, y_cal)
         log("[cal] done")
 
-        # eval
-        val_proba = calibrator.predict_proba(X_val)[:, 1]
-        th, tpr, fpr = best_threshold_youden(y_val, val_proba)
-        test_proba = calibrator.predict_proba(X_test)[:, 1]
-        y_pred = (test_proba >= th).astype(int)
+        # Choose Youden threshold on UNBALANCED cal (calibrated probs)
+        cal_proba = calibrator.predict_proba(X_cal)[:, 1]
+        th, tpr, fpr = best_threshold_youden(y_cal, cal_proba)
+        auc_cal = roc_auc_score(y_cal, cal_proba) if len(np.unique(y_cal)) > 1 else float("nan")
 
-        log(f"[thr≥{thr}] Youden threshold={th:.3f} | TPR={tpr:.3f} FPR={fpr:.3f}")
-        log(f"[thr≥{thr}] AUC val={roc_auc_score(y_val, val_proba):.3f}  AUC test={roc_auc_score(y_test, test_proba):.3f}")
+        # Balanced sanity test (from training parquet split)
+        test_bal_proba = calibrator.predict_proba(X_test_bal)[:, 1]
+        auc_test_bal = roc_auc_score(y_test_bal, test_bal_proba) if len(np.unique(y_test_bal)) > 1 else float("nan")
+        y_pred_bal = (test_bal_proba >= th).astype(int)
 
-        print(f"[thr≥{thr}] Classification report @ Youden:", flush=True)
-        print(classification_report(y_test, y_pred), flush=True)
-        print(f"[thr≥{thr}] Confusion matrix:\n{confusion_matrix(y_test, y_pred)}", flush=True)
+        # Unbalanced eval (held-out from eval_features_path)
+        eval_proba = calibrator.predict_proba(X_eval)[:, 1]
+        auc_eval = roc_auc_score(y_eval, eval_proba) if len(np.unique(y_eval)) > 1 else float("nan")
+        y_pred_eval = (eval_proba >= th).astype(int)
 
-        # reliability plots (test split of training set)
+        log(f"[thr≥{thr}] Youden threshold (from UNBAL cal)={th:.3f} | TPR={tpr:.3f} FPR={fpr:.3f}")
+        log(f"[thr≥{thr}] AUC cal_unbal={auc_cal:.3f} | AUC test_bal_sanity={auc_test_bal:.3f} | AUC eval_unbal={auc_eval:.3f}")
+
+        print(f"[thr≥{thr}] Classification report on BALANCED sanity test @ Youden(from unbal cal):", flush=True)
+        print(classification_report(y_test_bal, y_pred_bal), flush=True)
+        print(f"[thr≥{thr}] Confusion matrix (balanced sanity):\n{confusion_matrix(y_test_bal, y_pred_bal)}", flush=True)
+
+        print(f"[thr≥{thr}] Classification report on UNBALANCED eval @ Youden(from unbal cal):", flush=True)
+        print(classification_report(y_eval, y_pred_eval), flush=True)
+        print(f"[thr≥{thr}] Confusion matrix (unbalanced eval):\n{confusion_matrix(y_eval, y_pred_eval)}", flush=True)
+
         if not NO_PLOTS:
             try:
-                plot_reliability(f"dep_ge{thr}_test", y_test, test_proba, thr_dir, n_bins=REL_BINS)
+                plot_reliability(f"dep_ge{thr}_unbal_cal", y_cal, cal_proba, thr_dir, n_bins=REL_BINS)
             except Exception as e:
-                log(f"[plot][WARN] reliability failed: {e}")
+                log(f"[plot][WARN] reliability (unbal cal) failed: {e}")
+            try:
+                plot_reliability(f"dep_ge{thr}_unbal_eval", y_eval, eval_proba, thr_dir, n_bins=REL_BINS)
+            except Exception as e:
+                log(f"[plot][WARN] reliability (unbal eval) failed: {e}")
 
         # save artifacts
         cat_model_path = thr_dir / f"catboost_dep_ge{thr}.cbm"
@@ -441,7 +518,14 @@ def main():
             "numeric_features": num_feats,
             "input_features_parquet": str(INPUT),
             "train_source": per_thr_paths.get(str(thr), str(INPUT)),
+            "unbalanced_source": unbal_source,
+            "unbalanced_cal_rows": int(len(df_cal_thr)),
+            "unbalanced_eval_rows": int(len(df_eval_thr)),
+            "unbalanced_cal_fraction": float(cal_frac),
             "config_used": cfg,
+            "auc_cal_unbalanced": auc_cal,
+            "auc_test_balanced_sanity": auc_test_bal,
+            "auc_eval_unbalanced": auc_eval,
         }
         with open(thr_dir / "meta.json", "w") as f:
             json.dump(meta, f, indent=2)
@@ -452,11 +536,9 @@ def main():
         }
 
     # ------------------------------
-    # Bin distribution evaluation + prediction samples (on unbalanced eval if provided)
+    # Bin distribution evaluation + prediction samples (on UNBALANCED eval split)
     # ------------------------------
-    if df_eval is None:
-        # fall back to INPUT test split if no eval parquet provided
-        df_eval = df_all.copy()
+    df_eval = df_eval_unbal.copy().reset_index(drop=True)
 
     X_eval = build_X(df_eval)
     dep_delay = pd.to_numeric(df_eval.get("DepDelayMinutes"), errors="coerce").fillna(0.0)
@@ -483,7 +565,7 @@ def main():
     except Exception:
         ll = float("nan")
     acc = accuracy_score(y_true_mc, y_pred_mc)
-    log(f"[BINS] eval logloss={ll:.4f}  acc={acc:.4f}")
+    log(f"[BINS] UNBAL eval logloss={ll:.4f}  acc={acc:.4f}")
 
     # explanations / probability strings
     df_eval["reason"] = df_eval.apply(make_reason_row, axis=1)
@@ -503,9 +585,9 @@ def main():
         fmt_probs(a, b, c, d) for a, b, c, d in zip(df_eval["p_ge15"], df_eval["p_ge30"], df_eval["p_ge45"], df_eval["p_ge60_raw"])
     ]
 
-    # save samples
+    # save samples (from UNBAL eval)
     sample_n = int(cfg.get("prediction_samples_n", 500))
-    sample = df_eval.sample(n=min(sample_n, len(df_eval)), random_state=int(cfg.get("random_seed", 42))).reset_index(drop=True)
+    sample = df_eval.sample(n=min(sample_n, len(df_eval)), random_state=SEED).reset_index(drop=True)
     sample_path = OUTDIR / "prediction_samples.parquet"
     sample.to_parquet(sample_path, index=False)
     log(f"[SAVE] prediction samples -> {sample_path}")
@@ -520,6 +602,10 @@ def main():
         "eval_logloss": ll,
         "eval_acc": acc,
         "eval_features_path": str(cfg.get("eval_features_path") or ""),
+        "unbalanced_source": unbal_source,
+        "unbalanced_cal_rows": int(len(df_cal_unbal)),
+        "unbalanced_eval_rows": int(len(df_eval_unbal)),
+        "unbalanced_cal_fraction": float(cal_frac),
     }
     with open(OUTDIR / "bins_meta.json", "w") as f:
         json.dump(bins_meta, f, indent=2)
