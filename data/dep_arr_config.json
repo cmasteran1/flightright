@@ -16,7 +16,8 @@
 
   "weather": {
     "cache_dir": "data/weather_cache",
-    "daily": true
+    "daily": true,
+    "hourly_at_dep": true
   },
 
   "add_aircraft_age": true,
@@ -33,15 +34,21 @@
   "history_output_path": "data/intermediate/history_pool_dep_WN_50_23-25.parquet",
 
   "features_dep": {
-    "holiday_windows": { "thanksgiving": 2, "christmas": 3 },
-
+    "holiday_windows": {
+      "thanksgiving": 2,
+      "christmas": 3
+    },
     "n_recent_flightnum_od": 20,
     "n_days_flightnum_od": 14,
     "low_support_leq": 2,
+    "n_days_carrier_network": 14,
+  "add_aircraft_type": true,
+  "faa_registry": {
+    "master_path": "data/faa/master.txt",
+    "acftref_path": "data/faa/acftref.txt"
+  }
 
-    "n_days_carrier_network": 14
   },
-
   "output_features_unbalanced_path": "data/processed/features_dep_WN_50_23-25_unbalanced.parquet",
 
   "balance": {
@@ -51,14 +58,12 @@
 
   "feature_balance": {
     "enabled": true,
-
     "eval": {
       "enabled": true,
       "by": "last_days",
       "last_days": 90,
       "output_path": "data/processed/features_dep_WN_50_23-25_eval_unbalanced.parquet"
     },
-
     "thresholds": [15, 30, 45, 60],
     "pos_frac": 0.50,
     "seed": 42,

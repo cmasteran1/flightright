@@ -361,6 +361,226 @@ def add_aircraft_age(df: pd.DataFrame, reg_csv: str) -> pd.DataFrame:
     return df
 
 
+# ------------------------------ FAA aircraft type (from MASTER + ACFTREF) ------------------------------
+
+def _normalize_tail_number_series(s: pd.Series) -> pd.Series:
+    """
+    BTS Tail_Number typically like 'N12345' or 'N12345AA' (sometimes blanks/Unknown).
+    Normalize to uppercase alnum, ensure leading 'N' if it looks like an N-number.
+    """
+    x = s.astype("string").fillna("")
+    x = x.str.upper().str.strip()
+    # keep only A-Z0-9
+    x = x.str.replace(r"[^A-Z0-9]", "", regex=True)
+
+    # If it already starts with N -> keep; else if it's purely digits/letters and looks like an N-number w/o N, prefix N.
+    # (FAA MASTER 'N-NUMBER' is often without the leading 'N'.)
+    needs_n = (~x.str.startswith("N")) & (x.str.len() > 0)
+    x = x.where(~needs_n, "N" + x)
+    return x
+
+import csv
+from pathlib import Path
+import pandas as pd
+import numpy as np
+
+
+def _clean_faa_colname(c: str) -> str:
+    if c is None:
+        return ""
+    c = str(c).strip()
+    # handle actual BOM and mojibake BOM
+    c = c.replace("\ufeff", "")
+    c = c.replace("ï»¿", "")
+    return c.strip()
+
+
+def _read_faa_two_cols_csv(path: Path, col_a: str, col_b: str) -> pd.DataFrame:
+    """
+    Robustly read ONLY two columns from FAA comma-delimited text tables.
+    This avoids pandas choking on malformed quotes somewhere deep in the file.
+
+    - Uses utf-8-sig to strip BOM if present
+    - csv.reader(strict=False) to tolerate broken quoting
+    - Pads/truncates rows to header length
+    """
+    path = Path(path)
+    col_a = _clean_faa_colname(col_a)
+    col_b = _clean_faa_colname(col_b)
+
+    with open(path, "r", encoding="utf-8-sig", errors="replace", newline="") as f:
+        reader = csv.reader(
+            f,
+            delimiter=",",
+            quotechar='"',
+            doublequote=True,
+            escapechar="\\",
+            strict=False,   # <- key: don't crash on bad quotes
+            skipinitialspace=True,
+        )
+
+        header = next(reader, None)
+        if header is None:
+            raise RuntimeError(f"Empty FAA table: {path}")
+
+        # Clean + fix trailing empty header caused by trailing comma
+        header = [_clean_faa_colname(h) for h in header]
+        while header and header[-1] == "":
+            header.pop()
+
+        # Find requested column indices (handle BOM/mangled names)
+        try:
+            ia = header.index(col_a)
+        except ValueError:
+            # try also with BOM-stripped header variants
+            header2 = [_clean_faa_colname(h) for h in header]
+            ia = header2.index(col_a)  # will raise if still missing
+
+        try:
+            ib = header.index(col_b)
+        except ValueError:
+            header2 = [_clean_faa_colname(h) for h in header]
+            ib = header2.index(col_b)
+
+        ncols = len(header)
+
+        out_a = []
+        out_b = []
+
+        for row in reader:
+            if not row:
+                continue
+            # some lines may have a trailing comma -> extra empty field
+            # some lines may be short due to parse issues -> pad
+            if len(row) < ncols:
+                row = row + [""] * (ncols - len(row))
+            elif len(row) > ncols:
+                row = row[:ncols]
+
+            va = row[ia].strip()
+            vb = row[ib].strip()
+            out_a.append(va)
+            out_b.append(vb)
+
+    return pd.DataFrame({col_a: out_a, col_b: out_b})
+
+
+def _read_faa_acftref_lookup(path: Path) -> pd.DataFrame:
+    """
+    Read CODE, MFR, MODEL from acftref.txt robustly.
+    """
+    df = _read_faa_two_cols_csv(path, "CODE", "MFR")
+    # Need MODEL too; read again just for MODEL and merge by row order is unsafe.
+    # Better: read 3 columns via same robust method (small file; safe to parse full with csv)
+    path = Path(path)
+    with open(path, "r", encoding="utf-8-sig", errors="replace", newline="") as f:
+        reader = csv.reader(f, delimiter=",", quotechar='"', doublequote=True, escapechar="\\",
+                            strict=False, skipinitialspace=True)
+        header = next(reader, None)
+        if header is None:
+            raise RuntimeError(f"Empty FAA table: {path}")
+        header = [_clean_faa_colname(h) for h in header]
+        while header and header[-1] == "":
+            header.pop()
+        need = ["CODE", "MFR", "MODEL"]
+        idx = {}
+        for k in need:
+            if k not in header:
+                raise RuntimeError(f"FAA acftref missing column {k}. Got={header[:20]}")
+            idx[k] = header.index(k)
+        ncols = len(header)
+        rows = []
+        for row in reader:
+            if not row:
+                continue
+            if len(row) < ncols:
+                row = row + [""] * (ncols - len(row))
+            elif len(row) > ncols:
+                row = row[:ncols]
+            rows.append(
+                (row[idx["CODE"]].strip(), row[idx["MFR"]].strip(), row[idx["MODEL"]].strip())
+            )
+    out = pd.DataFrame(rows, columns=["CODE", "MFR", "MODEL"])
+    return out
+
+
+def _normalize_tail_to_nnumber(tail: str) -> str:
+    """
+    BTS Tail_Number: 'N12345' -> FAA 'N-NUMBER' typically '12345'
+    """
+    if tail is None or (isinstance(tail, float) and np.isnan(tail)):
+        return ""
+    s = str(tail).strip().upper()
+    if s.startswith("N"):
+        s = s[1:]
+    s = s.strip()
+    s = s.lstrip("0")
+    return s
+
+
+def add_aircraft_type_from_faa_registry(df: pd.DataFrame, cfg: dict) -> pd.DataFrame:
+    df = df.copy()
+    df["Tail_Number"] = df.get("Tail_Number", "").astype(str).str.upper().str.strip()
+
+    faa_cfg = cfg.get("faa_registry") or {}
+    master_path = faa_cfg.get("master_txt") or faa_cfg.get("master_path") or "data/faa/master.txt"
+    acftref_path = faa_cfg.get("acftref_txt") or faa_cfg.get("acftref_path") or "data/faa/acftref.txt"
+
+    master_p = _abspath(master_path)
+    acftref_p = _abspath(acftref_path)
+
+    if not master_p.exists() or not acftref_p.exists():
+        print(f"[WARN] FAA registry files not found; skipping aircraft_type. master={master_p} acftref={acftref_p}")
+        df["aircraft_type"] = df.get("aircraft_type", "Unknown")
+        return df
+
+    # Read only the needed columns from master (robust)
+    master_small = _read_faa_two_cols_csv(master_p, "N-NUMBER", "MFR MDL CODE")
+    master_small = master_small.rename(columns={"MFR MDL CODE": "faa_mfr_mdl_code"})
+    master_small["N-NUMBER"] = master_small["N-NUMBER"].astype(str).str.strip()
+    master_small["faa_mfr_mdl_code"] = master_small["faa_mfr_mdl_code"].astype(str).str.strip()
+
+    # Read acftref lookup
+    acftref_small = _read_faa_acftref_lookup(acftref_p)
+    acftref_small["CODE"] = acftref_small["CODE"].astype(str).str.strip()
+    acftref_small["MFR"] = acftref_small["MFR"].astype(str).str.strip()
+    acftref_small["MODEL"] = acftref_small["MODEL"].astype(str).str.strip()
+
+    # Normalize tail numbers to FAA key
+    df["_faa_nnumber"] = df["Tail_Number"].map(_normalize_tail_to_nnumber)
+
+    # Join in mfr_mdl_code
+    df = df.merge(
+        master_small.rename(columns={"N-NUMBER": "_faa_nnumber"}),
+        on="_faa_nnumber",
+        how="left",
+    )
+
+    # Join in MFR/MODEL via code
+    df = df.merge(
+        acftref_small.rename(columns={"CODE": "faa_mfr_mdl_code"}),
+        on="faa_mfr_mdl_code",
+        how="left",
+    )
+
+    # Build aircraft_type
+    mfr = df["MFR"].where(df["MFR"].notna(), "")
+    mdl = df["MODEL"].where(df["MODEL"].notna(), "")
+    atype = (mfr.astype(str).str.strip() + " " + mdl.astype(str).str.strip()).str.strip()
+    df["aircraft_type"] = atype.where(atype != "", "Unknown")
+
+    # cleanup
+    df = df.drop(columns=["_faa_nnumber"], errors="ignore")
+
+    unk = (df["aircraft_type"] == "Unknown").mean() * 100.0
+    ok = 100.0 - unk
+    print(f"[INFO] FAA aircraft_type match_rate={ok:.3f}% (Unknown={unk:.3f}%)")
+
+    return df
+
+
+
+
 # ------------------------------ history pool (for later feature engineering) ------------------------------
 
 def build_and_write_history_pool(cfg: dict) -> Optional[Path]:
@@ -482,6 +702,14 @@ def main():
 
     # local scheduled times
     df = add_timezone_local_times(df, airports_meta=airports_meta)
+
+    # FAA aircraft type (local files; no network)
+    # after filters / before timezones/weather is fine
+    if bool(cfg.get("add_aircraft_type", True)):
+        df = add_aircraft_type_from_faa_registry(df, cfg)
+    else:
+        if "aircraft_type" not in df.columns:
+            df["aircraft_type"] = "Unknown"
 
     # optional aircraft age
     if bool(cfg.get("add_aircraft_age", True)):

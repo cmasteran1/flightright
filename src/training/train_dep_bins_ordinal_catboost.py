@@ -3,19 +3,22 @@
 #
 # Ordinal/binned departure-delay probability model via calibrated P(delay >= thr).
 #
-# Run from REPO_ROOT:
+# Run from REPO_ROOT (legacy):
 #   python src/training/train_dep_bins_ordinal_catboost.py \
 #       data/processed/features_dep_WN_50_23-25_unbalanced.parquet \
 #       data/models/dep_bins_WN \
 #       data/models/dep_bins_WN_config.json
 #
-# Notes:
-# - You can train each threshold on its OWN balanced feature parquet (recommended) by
-#   setting cfg["per_threshold_train_paths"].
-# - Calibration/evaluation can be done on an unbalanced eval parquet (recommended):
-#     cfg["eval_features_path"] = "..._eval_unbalanced.parquet"
-# - This version fits calibrators on an UNBALANCED calibration split derived from
-#   cfg["eval_features_path"] when provided.
+# NEW (config-only):
+#   python src/training/train_dep_bins_ordinal_catboost.py data/models/dep_bins_WN_config.json
+#
+# Config-only mode expects (at minimum):
+#   {
+#     "input_features_path": "data/processed/features_dep_..._unbalanced.parquet",
+#     "outdir": "data/models/dep_bins_WN",
+#     "eval_features_path": "data/processed/features_dep_..._eval_unbalanced.parquet",
+#     ...
+#   }
 #
 import os, sys, json, time, signal, faulthandler
 from pathlib import Path
@@ -79,8 +82,9 @@ def best_threshold_youden(y_true, y_proba):
 
 def as_str(series: pd.Series) -> pd.Series:
     s = series.astype("object")
-    s = s.where(~s.isna(), "Unknown").astype("object")
-    return s.map(lambda v: "Unknown" if pd.isna(v) else str(v))
+    s = s.where(~pd.isna(s), "Unknown")
+    s = s.map(lambda v: "Unknown" if str(v).strip().lower() in ("", "nan", "none") else str(v))
+    return s.astype("object")
 
 def reliability_table(y_true, p_pred, n_bins=10):
     y_true = pd.Series(y_true).reset_index(drop=True)
@@ -129,7 +133,6 @@ def enforce_monotone_ge_probs(p_ge: np.ndarray) -> np.ndarray:
     return p
 
 def ge_to_bins(p_ge15, p_ge30, p_ge45, p_ge60):
-    # ensure monotone
     p_ge = enforce_monotone_ge_probs(np.vstack([p_ge15, p_ge30, p_ge45, p_ge60]).T)
     p15, p30, p45, p60 = p_ge[:, 0], p_ge[:, 1], p_ge[:, 2], p_ge[:, 3]
 
@@ -140,7 +143,6 @@ def ge_to_bins(p_ge15, p_ge30, p_ge45, p_ge60):
     p_ge60  = np.maximum(0.0, p60)
 
     P = np.vstack([p_lt15, p_15_30, p_30_45, p_45_60, p_ge60]).T
-    # renormalize small numeric drift
     Z = P.sum(axis=1, keepdims=True)
     Z[Z == 0] = 1.0
     return P / Z
@@ -157,7 +159,6 @@ def true_bin_from_delay(dep_delay_min: pd.Series) -> pd.Series:
 
 def make_reason_row(row) -> str:
     reasons = []
-    # simple, controllable heuristics
     try:
         if pd.notna(row.get("flightnum_od_low_support")) and int(row["flightnum_od_low_support"]) == 1:
             reasons.append("limited flight-number history")
@@ -185,6 +186,22 @@ def make_reason_row(row) -> str:
     except Exception:
         pass
 
+    # Congestion signal (if present)
+    try:
+        v = row.get("origin_congestion_3h_total")
+        if pd.notna(v) and float(v) >= 30:
+            reasons.append("busy origin (recent congestion)")
+    except Exception:
+        pass
+
+    # T-100 “fullness” signal (if present)
+    try:
+        lf = row.get("od_month_load_factor_prev1")
+        if pd.notna(lf) and float(lf) >= 0.85:
+            reasons.append("typically high load factor (prior month)")
+    except Exception:
+        pass
+
     try:
         w = row.get("origin_daily_weathercode")
         if pd.notna(w):
@@ -197,7 +214,6 @@ def make_reason_row(row) -> str:
     return "; ".join(reasons[:3])
 
 def fmt_probs(p_ge15, p_ge30, p_ge45, p_ge60) -> str:
-    # avoid the NaN strings you were seeing: coerce + format
     def f(x):
         if x is None or (isinstance(x, float) and np.isnan(x)):
             return "nan"
@@ -229,6 +245,45 @@ def _split_unbalanced_for_cal_and_eval(df_unbal: pd.DataFrame, *, cal_size: floa
     df_eval = df_unbal.iloc[idx_eval].reset_index(drop=True)
     return df_cal, df_eval
 
+def _load_json(path: Path) -> dict:
+    with open(path, "r") as f:
+        return json.load(f)
+
+def _looks_like_json(p: Path) -> bool:
+    return p.suffix.lower() == ".json"
+
+def _resolve_run_args(argv):
+    """
+    Supported invocations:
+      1) script CONFIG.json
+      2) script INPUT.parquet OUTDIR
+      3) script INPUT.parquet OUTDIR CONFIG.json
+    Returns: (INPUT, OUTDIR, cfg_path_or_None)
+    """
+    if len(argv) == 2:
+        p = Path(argv[1])
+        if not _looks_like_json(p):
+            raise SystemExit("Config-only mode requires a .json file: python ... train_dep_bins_...py path/to/config.json")
+        cfg = _load_json(p)
+        in_path = cfg.get("input_features_path") or cfg.get("input_features_unbalanced_path")
+        outdir = cfg.get("outdir") or cfg.get("output_dir")
+        if not in_path or not outdir:
+            raise SystemExit("Config-only mode requires cfg['input_features_path'] (or input_features_unbalanced_path) and cfg['outdir'].")
+        return Path(in_path), Path(outdir), p
+
+    if len(argv) == 3:
+        return Path(argv[1]), Path(argv[2]), None
+
+    if len(argv) == 4:
+        return Path(argv[1]), Path(argv[2]), Path(argv[3])
+
+    raise SystemExit(
+        "Usage:\n"
+        "  python train_dep_bins_ordinal_catboost.py CONFIG.json\n"
+        "  python train_dep_bins_ordinal_catboost.py features_unbalanced.parquet outdir\n"
+        "  python train_dep_bins_ordinal_catboost.py features_unbalanced.parquet outdir config.json"
+    )
+
 
 # ------------------------------ main ------------------------------
 
@@ -236,12 +291,7 @@ def main():
     enable_periodic_traces()
     enable_usr1_trace()
 
-    if len(sys.argv) not in (3, 4):
-        print("Usage: python train_dep_bins_ordinal_catboost.py path/to/features_unbalanced.parquet path/to/outdir [path/to/config.json]")
-        sys.exit(1)
-
-    INPUT = Path(sys.argv[1])
-    OUTDIR = Path(sys.argv[2])
+    INPUT, OUTDIR, CFG_PATH = _resolve_run_args(sys.argv)
     OUTDIR.mkdir(parents=True, exist_ok=True)
 
     cfg = {
@@ -254,20 +304,38 @@ def main():
         "od_wait": 200,
         "random_seed": 42,
 
-        # You control feature list here (explicit, editable)
+        # Feature lists (explicit, editable).
         "categorical_features": [
             "Origin","Dest","od_pair","Reporting_Airline",
             "dep_dow","sched_dep_hour","is_holiday","aircraft_type",
             "origin_daily_weathercode","origin_dep_hour_weathercode",
+
+            # 0/1 flags: keep categorical so CatBoost treats as discrete + stable missing handling.
+            "has_recent_arrival_turn_5h",
         ],
         "numeric_features": [
+            # daily + dep-hour weather (numeric encodings)
             "origin_temp_max_K","origin_temp_min_K","origin_daily_precip_sum_mm",
             "origin_daily_windspeed_max_kmh",
             "origin_dep_temp_K","origin_dep_precip_mm","origin_dep_windspeed_kmh",
+
+            # history features
             "flightnum_od_depdelay_mean_lastN","flightnum_od_support_count_lastNd",
             "flightnum_od_low_support",
             "carrier_depdelay_mean_lastNdays","carrier_origin_depdelay_mean_lastNdays",
             "turn_time_hours",
+
+            # congestion/time features you added earlier
+            "origin_congestion_3h_total",
+            "origin_airline_congestion_3h_total",
+            "tail_leg_num_day",
+            "flightnum_hours_since_first_departure_today",
+
+            # NEW: seats + lagged T-100 “fullness” (safe for future flights: prev-month)
+            "aircraft_seats_est",
+            "od_month_pax_per_flight_prev1",
+            "od_month_seats_per_flight_prev1",
+            "od_month_load_factor_prev1",
         ],
 
         # Unbalanced eval parquet path (recommended). We'll split it into:
@@ -279,20 +347,19 @@ def main():
         # {"15": "...parquet", "30": "...parquet", ...}
         "per_threshold_train_paths": {},
 
-        # For per-threshold training, we still split balanced parquet into
-        # train / early-stop / balanced sanity test.
-        "split": {"test_size": 0.20, "val_size": 0.20},  # used only when per_threshold_train_paths is NOT provided
+        # For single-INPUT mode only (when per_threshold_train_paths is NOT provided)
+        "split": {"test_size": 0.20, "val_size": 0.20},
 
         # Fraction of the unbalanced eval parquet used for calibration.
-        # Remaining fraction used for unbalanced evaluation.
         "unbalanced_cal_size": 0.50,
 
         "max_rows": None,
+        "prediction_samples_n": 500,
     }
 
-    if len(sys.argv) == 4:
-        with open(Path(sys.argv[3]), "r") as f:
-            cfg.update(json.load(f))
+    # Merge config if provided (either via CFG_PATH or legacy 3rd arg)
+    if CFG_PATH is not None:
+        cfg.update(_load_json(CFG_PATH))
 
     if FAST:
         cfg["iterations"] = min(int(cfg.get("iterations", 4000)), 1200)
@@ -317,7 +384,6 @@ def main():
     dropped_missing = (len(cfg["categorical_features"]) - len(cat_feats)) + (len(cfg["numeric_features"]) - len(num_feats))
     log(f"[features] cats={len(cat_feats)} nums={len(num_feats)} dropped_missing={dropped_missing}", step=True)
 
-    # resolved feature list artifact
     (OUTDIR / "resolved_features.json").write_text(
         json.dumps({"categorical": cat_feats, "numeric": num_feats}, indent=2)
     )
@@ -327,6 +393,8 @@ def main():
         X = df[cat_feats + num_feats].copy()
         for c in cat_feats:
             X[c] = as_str(X[c])
+
+        # numeric: coerce, median-impute
         for c in num_feats:
             X[c] = pd.to_numeric(X[c], errors="coerce")
             if X[c].isna().any():
@@ -342,8 +410,7 @@ def main():
         return (d >= int(thr)).astype(int).values
 
     # ------------------------------
-    # Unbalanced calibration + unbalanced evaluation source:
-    # USE cfg["eval_features_path"] (your JSON already has it)
+    # Unbalanced calibration + unbalanced evaluation source
     # ------------------------------
     eval_path = str(cfg.get("eval_features_path") or "").strip()
     if not eval_path:
@@ -385,7 +452,7 @@ def main():
         df_train_base = df_es_val = df_test_base = None  # unused
 
     registry = {}
-    cat_idx = [i for i, c in enumerate(cat_feats)]  # column indices in X
+    cat_idx = [i for i, _c in enumerate(cat_feats)]  # column indices in X
 
     for thr in THRESHOLDS:
         log("="*18 + f" Train dep >= {thr} " + "="*18, step=True)
@@ -577,15 +644,16 @@ def main():
     df_eval["p_ge15"] = p_ge[15]
     df_eval["p_ge30"] = p_ge[30]
     df_eval["p_ge45"] = p_ge[45]
-    df_eval["p_ge60_raw"] = p_ge[60]  # raw p>=60 before bin conversion
+    df_eval["p_ge60_raw"] = p_ge[60]
 
     df_eval["predicted_delay_bin"] = df_eval["pred_bin"]
     df_eval["delay_explanation"] = df_eval["reason"]
     df_eval["delay_probabilities"] = [
-        fmt_probs(a, b, c, d) for a, b, c, d in zip(df_eval["p_ge15"], df_eval["p_ge30"], df_eval["p_ge45"], df_eval["p_ge60_raw"])
+        fmt_probs(a, b, c, d) for a, b, c, d in zip(
+            df_eval["p_ge15"], df_eval["p_ge30"], df_eval["p_ge45"], df_eval["p_ge60_raw"]
+        )
     ]
 
-    # save samples (from UNBAL eval)
     sample_n = int(cfg.get("prediction_samples_n", 500))
     sample = df_eval.sample(n=min(sample_n, len(df_eval)), random_state=SEED).reset_index(drop=True)
     sample_path = OUTDIR / "prediction_samples.parquet"
@@ -615,3 +683,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
