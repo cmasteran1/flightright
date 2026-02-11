@@ -15,11 +15,18 @@ import pandas as pd
 
 
 REPO_ROOT = Path.cwd()
+DATA_ROOT = (REPO_ROOT.parent / "flightrightdata").resolve()
 
 
-def _abspath(p: str) -> Path:
+def _abspath(p: str, *, base: str = "repo") -> Path:
     pp = Path(p)
-    return pp if pp.is_absolute() else (REPO_ROOT / pp)
+    if pp.is_absolute():
+        return pp
+    if base == "repo":
+        return (REPO_ROOT / pp).resolve()
+    if base == "data":
+        return (DATA_ROOT / pp).resolve()
+    raise ValueError("base must be 'repo' or 'data'")
 
 
 def _format_path_template(p: str, *, target: str, thr: Optional[int] = None) -> str:
@@ -101,27 +108,16 @@ def add_recent_flightnum_od_mean_from_history(
     n_days: int = 14,
     low_support_leq: int = 2,
 ) -> pd.DataFrame:
-    """
-    Vectorized approach:
-      - Combine hist + df (targets)
-      - Sort by key + FlightDate
-      - For each key group:
-          mean_lastN  = rolling mean of previous n_recent dep delays
-          support_Nd  = rolling count of previous flights within last n_days (time-based rolling)
-      - Return features for target rows only.
-    """
     df = df.copy()
 
     key = ["Reporting_Airline", "Flight_Number_Reporting_Airline", "Origin", "Dest"]
 
-    # --- normalize df ---
     for c in ["Reporting_Airline", "Origin", "Dest"]:
         if c in df.columns:
             df[c] = df[c].astype(str).str.upper()
     df["Flight_Number_Reporting_Airline"] = pd.to_numeric(df.get("Flight_Number_Reporting_Airline"), errors="coerce")
     df["FlightDate"] = pd.to_datetime(df["FlightDate"], errors="coerce").dt.normalize()
 
-    # --- normalize hist ---
     hist = hist.copy()
     for c in ["Reporting_Airline", "Origin", "Dest"]:
         if c in hist.columns:
@@ -138,16 +134,10 @@ def add_recent_flightnum_od_mean_from_history(
     hist_small["_is_target"] = False
 
     all_rows = pd.concat([hist_small, df_small], ignore_index=True)
-
-    # Drop rows missing key/date; dep delay can be NaN
     all_rows = all_rows.dropna(subset=["FlightDate"] + key).copy()
-
-    # Sort for rolling correctness
     all_rows = all_rows.sort_values(key + ["FlightDate"]).reset_index(drop=True)
 
-    # --- rolling mean of previous n_recent values (count-based) ---
     def _roll_mean_lastN(g: pd.DataFrame) -> pd.Series:
-        # IMPORTANT: return indexed by g.index so assignment aligns
         s = g["DepDelayMinutes"]
         out = s.shift(1).rolling(window=int(n_recent), min_periods=1).mean()
         out.index = g.index
@@ -157,18 +147,11 @@ def add_recent_flightnum_od_mean_from_history(
         all_rows.groupby(key, sort=False, group_keys=False).apply(_roll_mean_lastN)
     )
 
-    # --- support count in last n_days (time-based rolling) ---
     def _roll_support_lastNd(g: pd.DataFrame) -> pd.Series:
-        # g is already sorted by FlightDate because all_rows was sorted globally by key+FlightDate.
-        # Build a time-indexed series but keep original row index for alignment.
         tmp = pd.DataFrame({"FlightDate": g["FlightDate"].values}, index=g.index)
         tmp["ind"] = 1.0
-
-        # time-based rolling requires a DatetimeIndex; duplicates are fine, monotonic is what matters.
         s = tmp.set_index("FlightDate")["ind"]
         rolled = s.shift(1).rolling(f"{int(n_days)}D", min_periods=0).sum()
-
-        # rolled is indexed by FlightDate; we want values back in the same row order (tmp index / g.index)
         tmp2 = tmp.copy()
         tmp2["support"] = rolled.to_numpy()
         out = pd.Series(tmp2["support"].values, index=tmp2.index)
@@ -178,7 +161,6 @@ def add_recent_flightnum_od_mean_from_history(
         all_rows.groupby(key, sort=False, group_keys=False).apply(_roll_support_lastNd)
     )
 
-    # Cast support to int with NaNs -> 0
     supp = pd.to_numeric(all_rows["flightnum_od_support_count_lastNd"], errors="coerce").fillna(0).astype(np.int32)
     all_rows["flightnum_od_support_count_lastNd"] = supp.astype(np.int16)
 
@@ -186,7 +168,6 @@ def add_recent_flightnum_od_mean_from_history(
         all_rows["flightnum_od_support_count_lastNd"] <= int(low_support_leq)
     ).astype(np.int8)
 
-    # Pull back features for target rows and merge onto df
     feats = all_rows[all_rows["_is_target"]][
         ["FlightDate"] + key + [
             "flightnum_od_depdelay_mean_lastN",
@@ -197,7 +178,6 @@ def add_recent_flightnum_od_mean_from_history(
 
     df = df.merge(feats, on=["FlightDate"] + key, how="left")
 
-    # Final pandas dtypes
     df["flightnum_od_support_count_lastNd"] = (
         pd.to_numeric(df["flightnum_od_support_count_lastNd"], errors="coerce")
         .fillna(0)
@@ -212,7 +192,6 @@ def add_recent_flightnum_od_mean_from_history(
     return df
 
 
-# ---------- carrier baselines (dep delay, daily rolling) from HISTORY POOL ----------
 def add_carrier_dep_delay_baselines_from_history(df: pd.DataFrame, hist: pd.DataFrame, n_days: int = 14) -> pd.DataFrame:
     df = df.copy()
     df["FlightDate"] = pd.to_datetime(df["FlightDate"], errors="coerce").dt.normalize()
@@ -263,7 +242,6 @@ def add_carrier_dep_delay_baselines_from_history(df: pd.DataFrame, hist: pd.Data
     return df
 
 
-# ---------- turn-time proxy ----------
 def add_turn_time_hours(df: pd.DataFrame) -> pd.DataFrame:
     df = df.copy()
     df["Flight_Number_Reporting_Airline"] = pd.to_numeric(df.get("Flight_Number_Reporting_Airline"), errors="coerce")
@@ -283,7 +261,6 @@ def add_turn_time_hours(df: pd.DataFrame) -> pd.DataFrame:
     return df
 
 
-# ---------- labels ----------
 def add_dep_labels_for_thresholds(df: pd.DataFrame, thresholds: List[int], delay_col: str = "DepDelayMinutes") -> pd.DataFrame:
     df = df.copy()
     d = pd.to_numeric(df.get(delay_col), errors="coerce").fillna(0.0)
@@ -338,7 +315,7 @@ def main():
         print("Usage: python features_dep.py data/dep_arr_config.json")
         sys.exit(1)
 
-    cfg_path = _abspath(sys.argv[1])
+    cfg_path = _abspath(sys.argv[1], base="repo")
     with open(cfg_path, "r") as f:
         cfg = json.load(f)
 
@@ -349,15 +326,15 @@ def main():
     in_enriched = cfg.get("output_enriched_unbalanced_path")
     if not in_enriched:
         raise KeyError("cfg.output_enriched_unbalanced_path is required (written by prepare_dataset.py)")
-    in_path = _abspath(_format_path_template(in_enriched, target=target))
+    in_path = _abspath(_format_path_template(in_enriched, target=target), base="data")
     if not in_path.exists():
         raise FileNotFoundError(f"Enriched parquet not found: {in_path}")
 
     print(f"[INFO] reading enriched -> {in_path}")
     df = pd.read_parquet(in_path)
 
-    hist_path_cfg = cfg.get("history_output_path", "data/intermediate/history_pool_dep.parquet")
-    hist_path = _abspath(_format_path_template(hist_path_cfg, target=target))
+    hist_path_cfg = cfg.get("history_output_path", "intermediate/history_pool_dep.parquet")
+    hist_path = _abspath(_format_path_template(hist_path_cfg, target=target), base="data")
     if not hist_path.exists():
         raise FileNotFoundError(
             f"History pool parquet not found: {hist_path}\n"
@@ -417,9 +394,10 @@ def main():
     delay_col = (cfg.get("balance", {}) or {}).get("delay_col", "DepDelayMinutes")
     df = add_dep_labels_for_thresholds(df, thresholds, delay_col=delay_col)
 
-    out_feat_cfg = cfg.get("output_features_unbalanced_path", "data/processed/features_dep_unbalanced.parquet")
+    # default is now DATA_ROOT-relative
+    out_feat_cfg = cfg.get("output_features_unbalanced_path", "processed/features_dep_unbalanced.parquet")
     out_feat_cfg = _format_path_template(out_feat_cfg, target=target)
-    out_feat_path = _abspath(out_feat_cfg)
+    out_feat_path = _abspath(out_feat_cfg, base="data")
     out_feat_path.parent.mkdir(parents=True, exist_ok=True)
 
     df.to_parquet(out_feat_path, index=False)
@@ -445,9 +423,10 @@ def main():
         eval_df = df[eval_mask].copy()
         train_pool = df[~eval_mask].copy()
 
-        eval_out = eval_cfg.get("output_path", "data/processed/eval_dep_unbalanced.parquet")
+        # default is now DATA_ROOT-relative
+        eval_out = eval_cfg.get("output_path", "processed/eval_dep_unbalanced.parquet")
         eval_out = _format_path_template(eval_out, target=target)
-        eval_path = _abspath(eval_out)
+        eval_path = _abspath(eval_out, base="data")
         eval_path.parent.mkdir(parents=True, exist_ok=True)
         eval_df.to_parquet(eval_path, index=False)
 
@@ -460,7 +439,8 @@ def main():
     max_rows = fb.get("max_rows")
     max_rows = int(max_rows) if max_rows is not None else None
 
-    out_tmpl = fb.get("output_template", "data/processed/train_{target}_ge{thr}_balanced.parquet")
+    # default is now DATA_ROOT-relative
+    out_tmpl = fb.get("output_template", "processed/train_{target}_ge{thr}_balanced.parquet")
 
     for thr in thr_list:
         label_col = f"y_dep_ge{thr}"
@@ -470,7 +450,7 @@ def main():
         bal_df = balance_to_pos_frac(train_pool, label_col=label_col, pos_frac=pos_frac, seed=seed, max_rows=max_rows)
 
         out_p = _format_path_template(out_tmpl, target=target, thr=thr)
-        out_p = _abspath(out_p)
+        out_p = _abspath(out_p, base="data")
         out_p.parent.mkdir(parents=True, exist_ok=True)
         bal_df.to_parquet(out_p, index=False)
         print(f"[OK] wrote balanced feature train thr={thr} -> {out_p}")

@@ -8,7 +8,7 @@ from pathlib import Path
 import pandas as pd, requests
 
 BASE_URL = "https://transtats.bts.gov/PREZIP/On_Time_Marketing_Carrier_On_Time_Performance_Beginning_January_2018_{y}_{m}.zip"
-RAW_DIR = Path("../../data/raw_bts")
+RAW_DIR = Path("../../../flightrightdata/data/raw_bts")
 
 KEEP = [
 "Year","Quarter","Month","DayofMonth","DayOfWeek","FlightDate","Marketing_Airline_Network","Operated_or_Branded_Code_Share_Partners","DOT_ID_Marketing_Airline","IATA_Code_Marketing_Airline","Flight_Number_Marketing_Airline","Originally_Scheduled_Code_Share_Airline","DOT_ID_Originally_Scheduled_Code_Share_Airline","IATA_Code_Originally_Scheduled_Code_Share_Airline","Flight_Num_Originally_Scheduled_Code_Share_Airline","Operating_Airline ","DOT_ID_Operating_Airline","IATA_Code_Operating_Airline","Tail_Number","Flight_Number_Operating_Airline","OriginAirportID","OriginAirportSeqID","OriginCityMarketID","Origin","OriginCityName","OriginState","OriginStateFips","OriginStateName","OriginWac","DestAirportID","DestAirportSeqID","DestCityMarketID","Dest","DestCityName","DestState","DestStateFips","DestStateName","DestWac","CRSDepTime","DepTime","DepDelay","DepDelayMinutes","DepDel15","DepartureDelayGroups","DepTimeBlk","TaxiOut","WheelsOff","WheelsOn","TaxiIn","CRSArrTime","ArrTime","ArrDelay","ArrDelayMinutes","ArrDel15","ArrivalDelayGroups","ArrTimeBlk","Cancelled","CancellationCode","Diverted","CRSElapsedTime","ActualElapsedTime","AirTime","Flights","Distance","DistanceGroup","CarrierDelay","WeatherDelay","NASDelay","SecurityDelay","LateAircraftDelay","FirstDepTime","TotalAddGTime","LongestAddGTime"

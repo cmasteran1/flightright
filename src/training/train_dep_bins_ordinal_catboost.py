@@ -12,14 +12,6 @@
 # NEW (config-only):
 #   python src/training/train_dep_bins_ordinal_catboost.py data/models/dep_bins_WN_config.json
 #
-# Config-only mode expects (at minimum):
-#   {
-#     "input_features_path": "data/processed/features_dep_..._unbalanced.parquet",
-#     "outdir": "data/models/dep_bins_WN",
-#     "eval_features_path": "data/processed/features_dep_..._eval_unbalanced.parquet",
-#     ...
-#   }
-#
 import os, sys, json, time, signal, faulthandler
 from pathlib import Path
 
@@ -39,6 +31,14 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 
 from catboost import CatBoostClassifier, Pool
+
+
+REPO_ROOT = Path.cwd()
+DATA_ROOT = (REPO_ROOT.parent / "flightrightdata").resolve()
+
+def _as_data_path(p: Path) -> Path:
+    """If p is relative, treat it as DATA_ROOT-relative."""
+    return p if p.is_absolute() else (DATA_ROOT / p).resolve()
 
 
 FAST = os.getenv("FAST_TRAIN", "0") == "1"
@@ -123,10 +123,6 @@ def plot_reliability(tag, y_true, p_pred, outdir: Path, n_bins=10):
     log(f"[SAVE] reliability table -> {csv_path}")
 
 def enforce_monotone_ge_probs(p_ge: np.ndarray) -> np.ndarray:
-    """
-    p_ge shape = (n, k) for thresholds increasing.
-    Enforce p_ge[:,0] >= p_ge[:,1] >= ... by cumulative min.
-    """
     p = p_ge.copy()
     for j in range(1, p.shape[1]):
         p[:, j] = np.minimum(p[:, j], p[:, j-1])
@@ -186,7 +182,6 @@ def make_reason_row(row) -> str:
     except Exception:
         pass
 
-    # Congestion signal (if present)
     try:
         v = row.get("origin_congestion_3h_total")
         if pd.notna(v) and float(v) >= 30:
@@ -194,7 +189,6 @@ def make_reason_row(row) -> str:
     except Exception:
         pass
 
-    # T-100 “fullness” signal (if present)
     try:
         lf = row.get("od_month_load_factor_prev1")
         if pd.notna(lf) and float(lf) >= 0.85:
@@ -221,10 +215,6 @@ def fmt_probs(p_ge15, p_ge30, p_ge45, p_ge60) -> str:
     return f"P≥15={f(p_ge15)}, P≥30={f(p_ge30)}, P≥45={f(p_ge45)}, P≥60={f(p_ge60)}"
 
 def _split_unbalanced_for_cal_and_eval(df_unbal: pd.DataFrame, *, cal_size: float, seed: int):
-    """
-    Split an unbalanced dataframe into (calibration, eval) without forcing class balance.
-    We stratify on y>=15 only to keep both classes present in smaller samples.
-    """
     if len(df_unbal) < 20:
         return df_unbal.copy(), df_unbal.copy()
 
@@ -292,6 +282,11 @@ def main():
     enable_usr1_trace()
 
     INPUT, OUTDIR, CFG_PATH = _resolve_run_args(sys.argv)
+
+    # If user gives relative paths, treat them as DATA_ROOT-relative.
+    INPUT = _as_data_path(INPUT)
+    OUTDIR = _as_data_path(OUTDIR)
+
     OUTDIR.mkdir(parents=True, exist_ok=True)
 
     cfg = {
@@ -303,61 +298,37 @@ def main():
         "l2_leaf_reg": 5.0,
         "od_wait": 200,
         "random_seed": 42,
-
-        # Feature lists (explicit, editable).
         "categorical_features": [
             "Origin","Dest","od_pair","Reporting_Airline",
             "dep_dow","sched_dep_hour","is_holiday","aircraft_type",
             "origin_daily_weathercode","origin_dep_hour_weathercode",
-
-            # 0/1 flags: keep categorical so CatBoost treats as discrete + stable missing handling.
             "has_recent_arrival_turn_5h",
         ],
         "numeric_features": [
-            # daily + dep-hour weather (numeric encodings)
             "origin_temp_max_K","origin_temp_min_K","origin_daily_precip_sum_mm",
             "origin_daily_windspeed_max_kmh",
             "origin_dep_temp_K","origin_dep_precip_mm","origin_dep_windspeed_kmh",
-
-            # history features
             "flightnum_od_depdelay_mean_lastN","flightnum_od_support_count_lastNd",
             "flightnum_od_low_support",
             "carrier_depdelay_mean_lastNdays","carrier_origin_depdelay_mean_lastNdays",
             "turn_time_hours",
-
-            # congestion/time features you added earlier
             "origin_congestion_3h_total",
             "origin_airline_congestion_3h_total",
             "tail_leg_num_day",
             "flightnum_hours_since_first_departure_today",
-
-            # NEW: seats + lagged T-100 “fullness” (safe for future flights: prev-month)
             "aircraft_seats_est",
             "od_month_pax_per_flight_prev1",
             "od_month_seats_per_flight_prev1",
             "od_month_load_factor_prev1",
         ],
-
-        # Unbalanced eval parquet path (recommended). We'll split it into:
-        #   - unbalanced calibration (fit isotonic here)
-        #   - unbalanced evaluation (compute bins here)
         "eval_features_path": "",
-
-        # Optional: train each threshold on a different balanced features parquet:
-        # {"15": "...parquet", "30": "...parquet", ...}
         "per_threshold_train_paths": {},
-
-        # For single-INPUT mode only (when per_threshold_train_paths is NOT provided)
         "split": {"test_size": 0.20, "val_size": 0.20},
-
-        # Fraction of the unbalanced eval parquet used for calibration.
         "unbalanced_cal_size": 0.50,
-
         "max_rows": None,
         "prediction_samples_n": 500,
     }
 
-    # Merge config if provided (either via CFG_PATH or legacy 3rd arg)
     if CFG_PATH is not None:
         cfg.update(_load_json(CFG_PATH))
 
@@ -378,7 +349,6 @@ def main():
         df_all = df_all.sample(n=int(cfg["max_rows"]), random_state=SEED).reset_index(drop=True)
     log(f"Rows={len(df_all)} Cols={len(df_all.columns)}", step=True)
 
-    # pick features by intersection (explicit control still comes from config lists)
     cat_feats = [c for c in cfg["categorical_features"] if c in df_all.columns]
     num_feats = [c for c in cfg["numeric_features"] if c in df_all.columns]
     dropped_missing = (len(cfg["categorical_features"]) - len(cat_feats)) + (len(cfg["numeric_features"]) - len(num_feats))
@@ -393,8 +363,6 @@ def main():
         X = df[cat_feats + num_feats].copy()
         for c in cat_feats:
             X[c] = as_str(X[c])
-
-        # numeric: coerce, median-impute
         for c in num_feats:
             X[c] = pd.to_numeric(X[c], errors="coerce")
             if X[c].isna().any():
@@ -409,13 +377,10 @@ def main():
         d = pd.to_numeric(df.get("DepDelayMinutes"), errors="coerce").fillna(0.0)
         return (d >= int(thr)).astype(int).values
 
-    # ------------------------------
-    # Unbalanced calibration + unbalanced evaluation source
-    # ------------------------------
     eval_path = str(cfg.get("eval_features_path") or "").strip()
     if not eval_path:
         raise ValueError("cfg['eval_features_path'] must be set to an unbalanced parquet for calibration/eval.")
-
+    eval_path = str(_as_data_path(Path(eval_path)))
     df_unbal = pd.read_parquet(eval_path)
     log(f"[unbalanced] loaded eval_features_path={eval_path} rows={len(df_unbal)}", step=True)
 
@@ -424,11 +389,9 @@ def main():
     unbal_source = f"eval_features_path:{eval_path}"
     log(f"[unbalanced] split -> cal={len(df_cal_unbal)} eval={len(df_eval_unbal)} (cal_size={cal_frac:.2f})", step=True)
 
-    # train sources per-threshold
     per_thr_paths = cfg.get("per_threshold_train_paths") or {}
     per_thr_paths = {str(k): str(v) for k, v in per_thr_paths.items()}
 
-    # If no per-threshold train paths, we do a single split from df_all
     if not per_thr_paths:
         base_y = make_y(df_all, 15)
         idx = np.arange(len(df_all))
@@ -446,24 +409,24 @@ def main():
         log(f"[split] sizes train={len(idx_train)} val={len(idx_val)} test={len(idx_test)}")
 
         df_train_base = df_all.iloc[idx_train].reset_index(drop=True)
-        df_es_val     = df_all.iloc[idx_val].reset_index(drop=True)   # early stopping
-        df_test_base  = df_all.iloc[idx_test].reset_index(drop=True)  # balanced-ish sanity
+        df_es_val     = df_all.iloc[idx_val].reset_index(drop=True)
+        df_test_base  = df_all.iloc[idx_test].reset_index(drop=True)
     else:
-        df_train_base = df_es_val = df_test_base = None  # unused
+        df_train_base = df_es_val = df_test_base = None
 
     registry = {}
-    cat_idx = [i for i, _c in enumerate(cat_feats)]  # column indices in X
+    cat_idx = [i for i, _c in enumerate(cat_feats)]
 
     for thr in THRESHOLDS:
         log("="*18 + f" Train dep >= {thr} " + "="*18, step=True)
         thr_dir = OUTDIR / f"thr_{thr}"
         thr_dir.mkdir(parents=True, exist_ok=True)
 
-        # choose train set
         if per_thr_paths:
             p = per_thr_paths.get(str(thr))
             if not p:
                 raise ValueError(f"per_threshold_train_paths missing threshold {thr}")
+            p = str(_as_data_path(Path(p)))
             df_tr = pd.read_parquet(p)
 
             base_y = make_y(df_tr, thr)
@@ -477,14 +440,13 @@ def main():
             )
 
             df_train = df_tr.iloc[idx_train].reset_index(drop=True)
-            df_es    = df_tr.iloc[idx_es].reset_index(drop=True)     # early stopping
-            df_test  = df_tr.iloc[idx_test].reset_index(drop=True)   # balanced sanity test
+            df_es    = df_tr.iloc[idx_es].reset_index(drop=True)
+            df_test  = df_tr.iloc[idx_test].reset_index(drop=True)
 
             log(f"[data] per-threshold train={p} sizes train={len(df_train)} earlystop={len(df_es)} test={len(df_test)}")
         else:
             df_train, df_es, df_test = df_train_base, df_es_val, df_test_base
 
-        # Unbalanced calibration/eval are shared across thresholds (labels differ per thr)
         df_cal_thr  = df_cal_unbal
         df_eval_thr = df_eval_unbal
 
@@ -529,23 +491,19 @@ def main():
         clf.fit(train_pool, eval_set=es_pool, use_best_model=True)
         log("[cb] fit done")
 
-        # CALIBRATE ON UNBALANCED CAL SPLIT (from eval_features_path)
         log(f"[cal] isotonic calibration on UNBALANCED cal split (source={unbal_source}) size={len(df_cal_thr)}")
         calibrator = CalibratedClassifierCV(estimator=clf, cv="prefit", method="isotonic")
         calibrator.fit(X_cal, y_cal)
         log("[cal] done")
 
-        # Choose Youden threshold on UNBALANCED cal (calibrated probs)
         cal_proba = calibrator.predict_proba(X_cal)[:, 1]
         th, tpr, fpr = best_threshold_youden(y_cal, cal_proba)
         auc_cal = roc_auc_score(y_cal, cal_proba) if len(np.unique(y_cal)) > 1 else float("nan")
 
-        # Balanced sanity test (from training parquet split)
         test_bal_proba = calibrator.predict_proba(X_test_bal)[:, 1]
         auc_test_bal = roc_auc_score(y_test_bal, test_bal_proba) if len(np.unique(y_test_bal)) > 1 else float("nan")
         y_pred_bal = (test_bal_proba >= th).astype(int)
 
-        # Unbalanced eval (held-out from eval_features_path)
         eval_proba = calibrator.predict_proba(X_eval)[:, 1]
         auc_eval = roc_auc_score(y_eval, eval_proba) if len(np.unique(y_eval)) > 1 else float("nan")
         y_pred_eval = (eval_proba >= th).astype(int)
@@ -571,7 +529,6 @@ def main():
             except Exception as e:
                 log(f"[plot][WARN] reliability (unbal eval) failed: {e}")
 
-        # save artifacts
         cat_model_path = thr_dir / f"catboost_dep_ge{thr}.cbm"
         clf.save_model(str(cat_model_path))
         joblib.dump(calibrator, thr_dir / f"calibrated_dep_ge{thr}.joblib")
@@ -602,29 +559,22 @@ def main():
             "cal_path": str(thr_dir / f"calibrated_dep_ge{thr}.joblib"),
         }
 
-    # ------------------------------
-    # Bin distribution evaluation + prediction samples (on UNBALANCED eval split)
-    # ------------------------------
     df_eval = df_eval_unbal.copy().reset_index(drop=True)
-
     X_eval = build_X(df_eval)
     dep_delay = pd.to_numeric(df_eval.get("DepDelayMinutes"), errors="coerce").fillna(0.0)
     df_eval = df_eval.copy()
     df_eval["true_bin"] = true_bin_from_delay(dep_delay)
 
-    # load calibrators and compute p_ge for eval
     p_ge = {}
     for thr in THRESHOLDS:
         cal = joblib.load(registry[thr]["cal_path"])
         p_ge[thr] = cal.predict_proba(X_eval)[:, 1].astype(float)
 
-    # bin probabilities
     P = ge_to_bins(p_ge[15], p_ge[30], p_ge[45], p_ge[60])
     bin_labels = ["< 15 min", "15–30 min", "30–45 min", "45–60 min", "≥ 60 min"]
     pred_idx = np.argmax(P, axis=1)
     df_eval["pred_bin"] = pd.Series([bin_labels[i] for i in pred_idx], index=df_eval.index)
 
-    # eval metrics
     y_true_mc = pd.Categorical(df_eval["true_bin"], categories=bin_labels, ordered=True).codes
     y_pred_mc = pred_idx
     try:
@@ -634,7 +584,6 @@ def main():
     acc = accuracy_score(y_true_mc, y_pred_mc)
     log(f"[BINS] UNBAL eval logloss={ll:.4f}  acc={acc:.4f}")
 
-    # explanations / probability strings
     df_eval["reason"] = df_eval.apply(make_reason_row, axis=1)
     df_eval["p_lt15"]  = P[:, 0]
     df_eval["p_15_30"] = P[:, 1]
@@ -683,4 +632,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-

@@ -17,14 +17,27 @@ import pandas as pd
 
 
 REPO_ROOT = Path.cwd()  # you always run from REPO_ROOT
-DATA_DIR = REPO_ROOT / "data"
+DATA_ROOT = (REPO_ROOT.parent / "flightrightdata").resolve()
 
 
 # ------------------------------ path helpers ------------------------------
 
-def _abspath(p: str) -> Path:
+def _abspath(p: str, *, base: str = "repo") -> Path:
+    """
+    Resolve a path string to an absolute Path.
+
+    base="repo": resolve relative paths against REPO_ROOT (checked-in configs, meta files, etc.)
+    base="data": resolve relative paths against DATA_ROOT (ALL generated datasets, caches, outputs)
+    """
     pp = Path(p)
-    return pp if pp.is_absolute() else (REPO_ROOT / pp)
+    if pp.is_absolute():
+        return pp
+
+    if base == "repo":
+        return (REPO_ROOT / pp).resolve()
+    if base == "data":
+        return (DATA_ROOT / pp).resolve()
+    raise ValueError("base must be 'repo' or 'data'")
 
 def _format_path_template(p: str, *, target: str, thr: Optional[int] = None) -> str:
     # Supports {target} and {thr} placeholders.
@@ -36,7 +49,9 @@ def _expand_inputs(patterns: List[str]) -> List[Path]:
     files: List[Path] = []
     seen = set()
     for pat in patterns:
-        full = str(_abspath(pat))
+        # Inputs: treat as repo-relative unless the user puts them elsewhere explicitly.
+        # If you want inputs to default under flightrightdata too, change base="repo" -> base="data".
+        full = str(_abspath(pat, base="repo"))
         hits = sorted(glob.glob(full))
         for h in hits:
             p = Path(h)
@@ -108,7 +123,8 @@ def read_input_parquet(input_flights_path: List[str]) -> pd.DataFrame:
 # ------------------------------ airport metadata ------------------------------
 
 def load_airport_meta(airports_csv_path: str) -> pd.DataFrame:
-    p = _abspath(airports_csv_path)
+    # airports CSV is a small, checked-in meta file by default -> repo base
+    p = _abspath(airports_csv_path, base="repo")
     if not p.exists():
         raise FileNotFoundError(f"airports_csv not found: {p}")
     meta = pd.read_csv(p, dtype=str)
@@ -160,7 +176,7 @@ def _validate_tz_strings_for_needed(meta: pd.DataFrame, needed_iata: List[str]) 
         examples = ", ".join([f"{a}:{why}" for a, why in bad[:40]])
         raise RuntimeError(
             "[AIRPORT META ERROR] Bad airport metadata for airports required by your filtered dataset.\n"
-            f"airports_csv={_abspath('data/meta/airports.csv')}\n"
+            f"airports_csv={_abspath('data/meta/airports.csv', base='repo')}\n"
             f"Examples: {examples}{' ...' if len(bad)>40 else ''}\n"
             "Fix Latitude/Longitude/Timezone (IANA tz names like 'America/Chicago') for these IATA codes."
         )
@@ -296,7 +312,8 @@ def add_origin_weather_daily(df, airports_meta: Dict[str, Tuple[float, float, st
     df = df.copy()
     df["FlightDate"] = pd.to_datetime(df["FlightDate"], errors="coerce")
 
-    cache_dir = _abspath(cache_dir)
+    # Cache is ALWAYS data-root-relative unless user provides absolute path.
+    cache_dir = _abspath(cache_dir, base="data")
     cache_dir.mkdir(parents=True, exist_ok=True)
 
     start = df["FlightDate"].min().strftime("%Y-%m-%d")
@@ -331,7 +348,9 @@ def add_origin_weather_daily(df, airports_meta: Dict[str, Tuple[float, float, st
 # ------------------------------ aircraft age (optional) ------------------------------
 
 def add_aircraft_age(df: pd.DataFrame, reg_csv: str) -> pd.DataFrame:
-    reg_path = _abspath(reg_csv)
+    # Registry CSV default stays repo-relative because you may keep a small cleaned version in-repo;
+    # if you move it out, set it absolute or override in config.
+    reg_path = _abspath(reg_csv, base="repo")
     if not reg_path.exists():
         print(f"[WARN] aircraft registry not found at {reg_path}; skipping aircraft age.")
         df["Aircraft_Age_Years"] = np.nan
@@ -373,8 +392,6 @@ def _normalize_tail_number_series(s: pd.Series) -> pd.Series:
     # keep only A-Z0-9
     x = x.str.replace(r"[^A-Z0-9]", "", regex=True)
 
-    # If it already starts with N -> keep; else if it's purely digits/letters and looks like an N-number w/o N, prefix N.
-    # (FAA MASTER 'N-NUMBER' is often without the leading 'N'.)
     needs_n = (~x.str.startswith("N")) & (x.str.len() > 0)
     x = x.where(~needs_n, "N" + x)
     return x
@@ -389,21 +406,12 @@ def _clean_faa_colname(c: str) -> str:
     if c is None:
         return ""
     c = str(c).strip()
-    # handle actual BOM and mojibake BOM
     c = c.replace("\ufeff", "")
     c = c.replace("ï»¿", "")
     return c.strip()
 
 
 def _read_faa_two_cols_csv(path: Path, col_a: str, col_b: str) -> pd.DataFrame:
-    """
-    Robustly read ONLY two columns from FAA comma-delimited text tables.
-    This avoids pandas choking on malformed quotes somewhere deep in the file.
-
-    - Uses utf-8-sig to strip BOM if present
-    - csv.reader(strict=False) to tolerate broken quoting
-    - Pads/truncates rows to header length
-    """
     path = Path(path)
     col_a = _clean_faa_colname(col_a)
     col_b = _clean_faa_colname(col_b)
@@ -415,7 +423,7 @@ def _read_faa_two_cols_csv(path: Path, col_a: str, col_b: str) -> pd.DataFrame:
             quotechar='"',
             doublequote=True,
             escapechar="\\",
-            strict=False,   # <- key: don't crash on bad quotes
+            strict=False,
             skipinitialspace=True,
         )
 
@@ -423,18 +431,15 @@ def _read_faa_two_cols_csv(path: Path, col_a: str, col_b: str) -> pd.DataFrame:
         if header is None:
             raise RuntimeError(f"Empty FAA table: {path}")
 
-        # Clean + fix trailing empty header caused by trailing comma
         header = [_clean_faa_colname(h) for h in header]
         while header and header[-1] == "":
             header.pop()
 
-        # Find requested column indices (handle BOM/mangled names)
         try:
             ia = header.index(col_a)
         except ValueError:
-            # try also with BOM-stripped header variants
             header2 = [_clean_faa_colname(h) for h in header]
-            ia = header2.index(col_a)  # will raise if still missing
+            ia = header2.index(col_a)
 
         try:
             ib = header.index(col_b)
@@ -450,8 +455,6 @@ def _read_faa_two_cols_csv(path: Path, col_a: str, col_b: str) -> pd.DataFrame:
         for row in reader:
             if not row:
                 continue
-            # some lines may have a trailing comma -> extra empty field
-            # some lines may be short due to parse issues -> pad
             if len(row) < ncols:
                 row = row + [""] * (ncols - len(row))
             elif len(row) > ncols:
@@ -466,12 +469,7 @@ def _read_faa_two_cols_csv(path: Path, col_a: str, col_b: str) -> pd.DataFrame:
 
 
 def _read_faa_acftref_lookup(path: Path) -> pd.DataFrame:
-    """
-    Read CODE, MFR, MODEL from acftref.txt robustly.
-    """
     df = _read_faa_two_cols_csv(path, "CODE", "MFR")
-    # Need MODEL too; read again just for MODEL and merge by row order is unsafe.
-    # Better: read 3 columns via same robust method (small file; safe to parse full with csv)
     path = Path(path)
     with open(path, "r", encoding="utf-8-sig", errors="replace", newline="") as f:
         reader = csv.reader(f, delimiter=",", quotechar='"', doublequote=True, escapechar="\\",
@@ -505,9 +503,6 @@ def _read_faa_acftref_lookup(path: Path) -> pd.DataFrame:
 
 
 def _normalize_tail_to_nnumber(tail: str) -> str:
-    """
-    BTS Tail_Number: 'N12345' -> FAA 'N-NUMBER' typically '12345'
-    """
     if tail is None or (isinstance(tail, float) and np.isnan(tail)):
         return ""
     s = str(tail).strip().upper()
@@ -523,53 +518,46 @@ def add_aircraft_type_from_faa_registry(df: pd.DataFrame, cfg: dict) -> pd.DataF
     df["Tail_Number"] = df.get("Tail_Number", "").astype(str).str.upper().str.strip()
 
     faa_cfg = cfg.get("faa_registry") or {}
-    master_path = faa_cfg.get("master_txt") or faa_cfg.get("master_path") or "data/faa/master.txt"
-    acftref_path = faa_cfg.get("acftref_txt") or faa_cfg.get("acftref_path") or "data/faa/acftref.txt"
+    master_path = faa_cfg.get("master_txt") or faa_cfg.get("master_path") or "../flightrightdata/data/meta/master.txt"
+    acftref_path = faa_cfg.get("acftref_txt") or faa_cfg.get("acftref_path") or "../flightrightdata/data/meta/acftref.txt"
 
-    master_p = _abspath(master_path)
-    acftref_p = _abspath(acftref_path)
+    master_p = _abspath(master_path, base="repo")
+    acftref_p = _abspath(acftref_path, base="repo")
 
     if not master_p.exists() or not acftref_p.exists():
         print(f"[WARN] FAA registry files not found; skipping aircraft_type. master={master_p} acftref={acftref_p}")
         df["aircraft_type"] = df.get("aircraft_type", "Unknown")
         return df
 
-    # Read only the needed columns from master (robust)
     master_small = _read_faa_two_cols_csv(master_p, "N-NUMBER", "MFR MDL CODE")
     master_small = master_small.rename(columns={"MFR MDL CODE": "faa_mfr_mdl_code"})
     master_small["N-NUMBER"] = master_small["N-NUMBER"].astype(str).str.strip()
     master_small["faa_mfr_mdl_code"] = master_small["faa_mfr_mdl_code"].astype(str).str.strip()
 
-    # Read acftref lookup
     acftref_small = _read_faa_acftref_lookup(acftref_p)
     acftref_small["CODE"] = acftref_small["CODE"].astype(str).str.strip()
     acftref_small["MFR"] = acftref_small["MFR"].astype(str).str.strip()
     acftref_small["MODEL"] = acftref_small["MODEL"].astype(str).str.strip()
 
-    # Normalize tail numbers to FAA key
     df["_faa_nnumber"] = df["Tail_Number"].map(_normalize_tail_to_nnumber)
 
-    # Join in mfr_mdl_code
     df = df.merge(
         master_small.rename(columns={"N-NUMBER": "_faa_nnumber"}),
         on="_faa_nnumber",
         how="left",
     )
 
-    # Join in MFR/MODEL via code
     df = df.merge(
         acftref_small.rename(columns={"CODE": "faa_mfr_mdl_code"}),
         on="faa_mfr_mdl_code",
         how="left",
     )
 
-    # Build aircraft_type
     mfr = df["MFR"].where(df["MFR"].notna(), "")
     mdl = df["MODEL"].where(df["MODEL"].notna(), "")
     atype = (mfr.astype(str).str.strip() + " " + mdl.astype(str).str.strip()).str.strip()
     df["aircraft_type"] = atype.where(atype != "", "Unknown")
 
-    # cleanup
     df = df.drop(columns=["_faa_nnumber"], errors="ignore")
 
     unk = (df["aircraft_type"] == "Unknown").mean() * 100.0
@@ -577,8 +565,6 @@ def add_aircraft_type_from_faa_registry(df: pd.DataFrame, cfg: dict) -> pd.DataF
     print(f"[INFO] FAA aircraft_type match_rate={ok:.3f}% (Unknown={unk:.3f}%)")
 
     return df
-
-
 
 
 # ------------------------------ history pool (for later feature engineering) ------------------------------
@@ -593,8 +579,9 @@ def build_and_write_history_pool(cfg: dict) -> Optional[Path]:
         return None
 
     target = (cfg.get("target") or "dep").lower()
-    out_path_cfg = cfg.get("history_output_path", f"data/intermediate/history_pool_{target}.parquet")
-    out_path = _abspath(_format_path_template(out_path_cfg, target=target))
+    # default is now DATA_ROOT-relative
+    out_path_cfg = cfg.get("history_output_path", f"intermediate/history_pool_{target}.parquet")
+    out_path = _abspath(_format_path_template(out_path_cfg, target=target), base="data")
     out_path.parent.mkdir(parents=True, exist_ok=True)
 
     lookback_days = int(cfg.get("history_lookback_days", 60))
@@ -604,12 +591,10 @@ def build_and_write_history_pool(cfg: dict) -> Optional[Path]:
 
     hist["FlightDate"] = pd.to_datetime(hist["FlightDate"], errors="coerce")
 
-    # apply same filters as main pool (airport/airline/date), but without tz dependency
     if cfg.get("airports"):
         airports = set(a.upper() for a in cfg["airports"])
         hist["Origin"] = hist["Origin"].astype(str).str.upper()
         hist["Dest"] = hist["Dest"].astype(str).str.upper()
-        # NOTE: history is still both-in-set to match target population
         hist = hist[hist["Origin"].isin(airports) & hist["Dest"].isin(airports)]
 
     if cfg.get("single_airline"):
@@ -653,7 +638,8 @@ def main():
         print("Usage: python prepare_dataset.py data/dep_arr_config.json")
         sys.exit(1)
 
-    cfg_path = _abspath(sys.argv[1])
+    # Config file path stays repo-relative by default
+    cfg_path = _abspath(sys.argv[1], base="repo")
     with open(cfg_path, "r") as f:
         cfg = json.load(f)
 
@@ -663,24 +649,20 @@ def main():
 
     airports_csv = cfg.get("airports_csv", "data/meta/airports.csv")
     meta_df = load_airport_meta(airports_csv)
-    print(f"[INFO] airports_csv -> {_abspath(airports_csv)}  (exists={_abspath(airports_csv).exists()})")
+    print(f"[INFO] airports_csv -> {_abspath(airports_csv, base='repo')}  (exists={_abspath(airports_csv, base='repo').exists()})")
 
-    # load raw
     df = read_input_parquet(cfg["input_flights_path"])
     df = canonicalize_bts_columns(df)
 
-    # normalize types
     df["FlightDate"] = pd.to_datetime(df["FlightDate"], errors="coerce")
     for c in ["CRSDepTime", "CRSArrTime", "DepDelayMinutes", "ArrDelayMinutes", "DepDel15", "ArrDel15"]:
         if c in df.columns:
             df[c] = pd.to_numeric(df[c], errors="coerce")
 
-    # filters
     if cfg.get("airports"):
         airports = set(a.upper() for a in cfg["airports"])
         df["Origin"] = df["Origin"].astype(str).str.upper()
         df["Dest"] = df["Dest"].astype(str).str.upper()
-        # IMPORTANT: both Origin and Dest must be in set
         df = df[df["Origin"].isin(airports) & df["Dest"].isin(airports)]
 
     if cfg.get("single_airline"):
@@ -696,40 +678,34 @@ def main():
     if df.empty:
         raise RuntimeError("No rows after filtering (airports/airlines/date range).")
 
-    # validate tz ONLY for airports present after filtering (needed airports)
     needed_iata = sorted(pd.unique(pd.concat([df["Origin"], df["Dest"]]).astype(str).str.upper()))
     airports_meta = _validate_tz_strings_for_needed(meta_df, needed_iata)
 
-    # local scheduled times
     df = add_timezone_local_times(df, airports_meta=airports_meta)
 
-    # FAA aircraft type (local files; no network)
-    # after filters / before timezones/weather is fine
     if bool(cfg.get("add_aircraft_type", True)):
         df = add_aircraft_type_from_faa_registry(df, cfg)
     else:
         if "aircraft_type" not in df.columns:
             df["aircraft_type"] = "Unknown"
 
-    # optional aircraft age
     if bool(cfg.get("add_aircraft_age", True)):
         df = add_aircraft_age(df, reg_csv=cfg.get("aircraft_registry_csv", "data/aircraft_registry_clean.csv"))
 
-    # weather (daily origin only)
     weather_cfg = cfg.get("weather") or {}
     if bool(weather_cfg.get("daily", True)):
-        cache_dir = weather_cfg.get("cache_dir", "data/weather_cache")
+        # default is now DATA_ROOT-relative
+        cache_dir = weather_cfg.get("cache_dir", "weather_cache")
         df = add_origin_weather_daily(df, airports_meta=airports_meta, cache_dir=cache_dir)
 
-    # write enriched unbalanced
-    out_enriched = cfg.get("output_enriched_unbalanced_path", "data/intermediate/enriched_{target}_unbalanced.parquet")
+    # default is now DATA_ROOT-relative
+    out_enriched = cfg.get("output_enriched_unbalanced_path", "intermediate/enriched_{target}_unbalanced.parquet")
     out_enriched = _format_path_template(out_enriched, target=target)
-    out_path = _abspath(out_enriched)
+    out_path = _abspath(out_enriched, base="data")
     out_path.parent.mkdir(parents=True, exist_ok=True)
     df.to_parquet(out_path, index=False)
     print(f"[OK] wrote enriched unbalanced rows={len(df)} -> {out_path}")
 
-    # history pool (optional, but recommended for lag features)
     hp = build_and_write_history_pool(cfg)
     if hp is not None:
         print(f"[INFO] history pool -> {hp}")
