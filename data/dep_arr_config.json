@@ -8,7 +8,8 @@
   ],
 
   "airports_csv": "../flightrightdata/data/meta/airports.csv",
-  "airports": ["DEN","MDW","DAL","PHX","LAS","BWI","HOU","OAK","LAX","SAN","SJC","SMF","ONT","BUR","SNA","LGB","PDX","SEA","SLC","PHX","TUS","ABQ","ELP","AUS","SAT","DFW","IAH","MSY","BNA","ATL","MCO","TPA","FLL","MIA","PBI","JAX","RSW","RDU","CLT","ORF","RIC","CMH","CLE","DTW","MSP","STL","MCI","OKC","ICT"],
+  "airports_filter_csv": "../flightrightdata/data/meta/airport_rankings/WN_top_50.csv",
+  "airports_filter_column": "IATA",
   "airlines": ["WN"],
 
   "start_date": "2023-03-01",

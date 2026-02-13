@@ -192,6 +192,7 @@ def add_recent_flightnum_od_mean_from_history(
     return df
 
 
+# ---------- carrier baselines (dep delay, daily rolling) from HISTORY POOL ----------
 def add_carrier_dep_delay_baselines_from_history(df: pd.DataFrame, hist: pd.DataFrame, n_days: int = 14) -> pd.DataFrame:
     df = df.copy()
     df["FlightDate"] = pd.to_datetime(df["FlightDate"], errors="coerce").dt.normalize()
@@ -242,6 +243,7 @@ def add_carrier_dep_delay_baselines_from_history(df: pd.DataFrame, hist: pd.Data
     return df
 
 
+# ---------- turn-time proxy ----------
 def add_turn_time_hours(df: pd.DataFrame) -> pd.DataFrame:
     df = df.copy()
     df["Flight_Number_Reporting_Airline"] = pd.to_numeric(df.get("Flight_Number_Reporting_Airline"), errors="coerce")
@@ -261,6 +263,7 @@ def add_turn_time_hours(df: pd.DataFrame) -> pd.DataFrame:
     return df
 
 
+# ---------- labels ----------
 def add_dep_labels_for_thresholds(df: pd.DataFrame, thresholds: List[int], delay_col: str = "DepDelayMinutes") -> pd.DataFrame:
     df = df.copy()
     d = pd.to_numeric(df.get(delay_col), errors="coerce").fillna(0.0)

@@ -10,7 +10,7 @@ import glob
 from pathlib import Path
 from datetime import datetime, time as dtime, timedelta
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
-from typing import Optional, List, Dict, Tuple
+from typing import Optional, List, Dict, Tuple, Set
 
 import numpy as np
 import pandas as pd
@@ -39,11 +39,13 @@ def _abspath(p: str, *, base: str = "repo") -> Path:
         return (DATA_ROOT / pp).resolve()
     raise ValueError("base must be 'repo' or 'data'")
 
+
 def _format_path_template(p: str, *, target: str, thr: Optional[int] = None) -> str:
     # Supports {target} and {thr} placeholders.
     if thr is None:
         return p.format(target=target)
     return p.format(target=target, thr=thr)
+
 
 def _expand_inputs(patterns: List[str]) -> List[Path]:
     files: List[Path] = []
@@ -60,6 +62,7 @@ def _expand_inputs(patterns: List[str]) -> List[Path]:
                 files.append(p)
     return files
 
+
 def _parse_date_strict(s: str, field: str) -> pd.Timestamp:
     try:
         ts = pd.to_datetime(s, errors="raise")
@@ -68,6 +71,61 @@ def _parse_date_strict(s: str, field: str) -> pd.Timestamp:
     if pd.isna(ts):
         raise ValueError(f"Invalid date for cfg['{field}']={s!r}")
     return ts.normalize()
+
+
+# ------------------------------ airport filter list (CSV) ------------------------------
+
+def _load_airport_filter_set(cfg: dict) -> Optional[Set[str]]:
+    """
+    NEW behavior:
+      - Airport filtering is driven by a CSV file path in config, NOT a JSON list.
+      - Config key: cfg["airports_filter_csv"] (path to CSV)
+      - Optional: cfg["airports_filter_column"] (default "IATA"; if missing, we try first column)
+      - If airports_filter_csv is absent/empty -> no airport filtering.
+
+    Expected CSV forms:
+      1) With header containing IATA codes column (default column "IATA"), e.g.
+           IATA
+           ATL
+           CLT
+           ...
+      2) Single-column CSV with or without header; we will use the first column.
+    """
+    p_raw = (cfg.get("airports_filter_csv") or "").strip()
+    if not p_raw:
+        return None
+
+    # Treat as repo-relative unless absolute; if you keep it under flightrightdata,
+    # point to it as "../flightrightdata/..." (or use an absolute path).
+    p = _abspath(p_raw, base="repo")
+    if not p.exists():
+        raise FileNotFoundError(f"airports_filter_csv not found: {p}")
+
+    df = pd.read_csv(p, dtype=str)
+
+    if df.empty:
+        raise RuntimeError(f"airports_filter_csv is empty: {p}")
+
+    want_col = (cfg.get("airports_filter_column") or "IATA").strip()
+    cols = [str(c).strip() for c in df.columns]
+
+    if want_col in cols:
+        s = df[want_col]
+    else:
+        # Fall back to first column
+        s = df.iloc[:, 0]
+
+    airports = (
+        s.astype("string")
+        .fillna("")
+        .map(lambda x: str(x).strip().upper())
+    )
+    airports = airports[airports != ""].tolist()
+
+    if not airports:
+        raise RuntimeError(f"No airport codes found in airports_filter_csv: {p}")
+
+    return set(airports)
 
 
 # ------------------------------ BTS canonicalization ------------------------------
@@ -144,7 +202,12 @@ def load_airport_meta(airports_csv_path: str) -> pd.DataFrame:
     return meta
 
 
-def _validate_tz_strings_for_needed(meta: pd.DataFrame, needed_iata: List[str]) -> Dict[str, Tuple[float, float, str]]:
+def _validate_tz_strings_for_needed(
+    meta: pd.DataFrame,
+    needed_iata: List[str],
+    *,
+    airports_csv_for_msg: Optional[Path] = None,
+) -> Dict[str, Tuple[float, float, str]]:
     m = meta.set_index("IATA", drop=False)
 
     bad = []
@@ -174,9 +237,10 @@ def _validate_tz_strings_for_needed(meta: pd.DataFrame, needed_iata: List[str]) 
 
     if bad:
         examples = ", ".join([f"{a}:{why}" for a, why in bad[:40]])
+        csv_msg = str(airports_csv_for_msg) if airports_csv_for_msg is not None else "<unknown>"
         raise RuntimeError(
             "[AIRPORT META ERROR] Bad airport metadata for airports required by your filtered dataset.\n"
-            f"airports_csv={_abspath('data/meta/airports.csv', base='repo')}\n"
+            f"airports_csv={csv_msg}\n"
             f"Examples: {examples}{' ...' if len(bad)>40 else ''}\n"
             "Fix Latitude/Longitude/Timezone (IANA tz names like 'America/Chicago') for these IATA codes."
         )
@@ -285,6 +349,7 @@ DAILY_WEATHER_VARS = [
     "weathercode",
 ]
 
+
 def _fetch_daily_weather(lat, lon, start, end, tz):
     url = "https://archive-api.open-meteo.com/v1/archive"
     r = _req_with_backoff(
@@ -307,6 +372,7 @@ def _fetch_daily_weather(lat, lon, start, end, tz):
     w = pd.DataFrame(daily)
     w["FlightDate"] = pd.to_datetime(w["time"])
     return w.drop(columns=["time"])
+
 
 def add_origin_weather_daily(df, airports_meta: Dict[str, Tuple[float, float, str]], cache_dir: str):
     df = df.copy()
@@ -396,6 +462,7 @@ def _normalize_tail_number_series(s: pd.Series) -> pd.Series:
     x = x.where(~needs_n, "N" + x)
     return x
 
+
 import csv
 from pathlib import Path
 import pandas as pd
@@ -472,8 +539,15 @@ def _read_faa_acftref_lookup(path: Path) -> pd.DataFrame:
     df = _read_faa_two_cols_csv(path, "CODE", "MFR")
     path = Path(path)
     with open(path, "r", encoding="utf-8-sig", errors="replace", newline="") as f:
-        reader = csv.reader(f, delimiter=",", quotechar='"', doublequote=True, escapechar="\\",
-                            strict=False, skipinitialspace=True)
+        reader = csv.reader(
+            f,
+            delimiter=",",
+            quotechar='"',
+            doublequote=True,
+            escapechar="\\",
+            strict=False,
+            skipinitialspace=True,
+        )
         header = next(reader, None)
         if header is None:
             raise RuntimeError(f"Empty FAA table: {path}")
@@ -495,9 +569,7 @@ def _read_faa_acftref_lookup(path: Path) -> pd.DataFrame:
                 row = row + [""] * (ncols - len(row))
             elif len(row) > ncols:
                 row = row[:ncols]
-            rows.append(
-                (row[idx["CODE"]].strip(), row[idx["MFR"]].strip(), row[idx["MODEL"]].strip())
-            )
+            rows.append((row[idx["CODE"]].strip(), row[idx["MFR"]].strip(), row[idx["MODEL"]].strip()))
     out = pd.DataFrame(rows, columns=["CODE", "MFR", "MODEL"])
     return out
 
@@ -541,17 +613,8 @@ def add_aircraft_type_from_faa_registry(df: pd.DataFrame, cfg: dict) -> pd.DataF
 
     df["_faa_nnumber"] = df["Tail_Number"].map(_normalize_tail_to_nnumber)
 
-    df = df.merge(
-        master_small.rename(columns={"N-NUMBER": "_faa_nnumber"}),
-        on="_faa_nnumber",
-        how="left",
-    )
-
-    df = df.merge(
-        acftref_small.rename(columns={"CODE": "faa_mfr_mdl_code"}),
-        on="faa_mfr_mdl_code",
-        how="left",
-    )
+    df = df.merge(master_small.rename(columns={"N-NUMBER": "_faa_nnumber"}), on="_faa_nnumber", how="left")
+    df = df.merge(acftref_small.rename(columns={"CODE": "faa_mfr_mdl_code"}), on="faa_mfr_mdl_code", how="left")
 
     mfr = df["MFR"].where(df["MFR"].notna(), "")
     mdl = df["MODEL"].where(df["MODEL"].notna(), "")
@@ -591,10 +654,11 @@ def build_and_write_history_pool(cfg: dict) -> Optional[Path]:
 
     hist["FlightDate"] = pd.to_datetime(hist["FlightDate"], errors="coerce")
 
-    if cfg.get("airports"):
-        airports = set(a.upper() for a in cfg["airports"])
+    airports = _load_airport_filter_set(cfg)
+    if airports is not None:
         hist["Origin"] = hist["Origin"].astype(str).str.upper()
         hist["Dest"] = hist["Dest"].astype(str).str.upper()
+        # NOTE: history is still both-in-set to match target population
         hist = hist[hist["Origin"].isin(airports) & hist["Dest"].isin(airports)]
 
     if cfg.get("single_airline"):
@@ -648,21 +712,26 @@ def main():
         raise ValueError("cfg.target must be 'dep' or 'arr'")
 
     airports_csv = cfg.get("airports_csv", "data/meta/airports.csv")
+    airports_csv_resolved = _abspath(airports_csv, base="repo")
     meta_df = load_airport_meta(airports_csv)
-    print(f"[INFO] airports_csv -> {_abspath(airports_csv, base='repo')}  (exists={_abspath(airports_csv, base='repo').exists()})")
+    print(f"[INFO] airports_csv -> {airports_csv_resolved}  (exists={airports_csv_resolved.exists()})")
 
+    # load raw
     df = read_input_parquet(cfg["input_flights_path"])
     df = canonicalize_bts_columns(df)
 
+    # normalize types
     df["FlightDate"] = pd.to_datetime(df["FlightDate"], errors="coerce")
     for c in ["CRSDepTime", "CRSArrTime", "DepDelayMinutes", "ArrDelayMinutes", "DepDel15", "ArrDel15"]:
         if c in df.columns:
             df[c] = pd.to_numeric(df[c], errors="coerce")
 
-    if cfg.get("airports"):
-        airports = set(a.upper() for a in cfg["airports"])
+    # filters
+    airports = _load_airport_filter_set(cfg)
+    if airports is not None:
         df["Origin"] = df["Origin"].astype(str).str.upper()
         df["Dest"] = df["Dest"].astype(str).str.upper()
+        # IMPORTANT: both Origin and Dest must be in set
         df = df[df["Origin"].isin(airports) & df["Dest"].isin(airports)]
 
     if cfg.get("single_airline"):
@@ -678,26 +747,36 @@ def main():
     if df.empty:
         raise RuntimeError("No rows after filtering (airports/airlines/date range).")
 
+    # validate tz ONLY for airports present after filtering (needed airports)
     needed_iata = sorted(pd.unique(pd.concat([df["Origin"], df["Dest"]]).astype(str).str.upper()))
-    airports_meta = _validate_tz_strings_for_needed(meta_df, needed_iata)
+    airports_meta = _validate_tz_strings_for_needed(
+        meta_df,
+        needed_iata,
+        airports_csv_for_msg=airports_csv_resolved,
+    )
 
+    # local scheduled times
     df = add_timezone_local_times(df, airports_meta=airports_meta)
 
+    # FAA aircraft type (local files; no network)
     if bool(cfg.get("add_aircraft_type", True)):
         df = add_aircraft_type_from_faa_registry(df, cfg)
     else:
         if "aircraft_type" not in df.columns:
             df["aircraft_type"] = "Unknown"
 
+    # optional aircraft age
     if bool(cfg.get("add_aircraft_age", True)):
         df = add_aircraft_age(df, reg_csv=cfg.get("aircraft_registry_csv", "data/aircraft_registry_clean.csv"))
 
+    # weather (daily origin only)
     weather_cfg = cfg.get("weather") or {}
     if bool(weather_cfg.get("daily", True)):
         # default is now DATA_ROOT-relative
         cache_dir = weather_cfg.get("cache_dir", "weather_cache")
         df = add_origin_weather_daily(df, airports_meta=airports_meta, cache_dir=cache_dir)
 
+    # write enriched unbalanced
     # default is now DATA_ROOT-relative
     out_enriched = cfg.get("output_enriched_unbalanced_path", "intermediate/enriched_{target}_unbalanced.parquet")
     out_enriched = _format_path_template(out_enriched, target=target)
@@ -706,6 +785,7 @@ def main():
     df.to_parquet(out_path, index=False)
     print(f"[OK] wrote enriched unbalanced rows={len(df)} -> {out_path}")
 
+    # history pool (optional, but recommended for lag features)
     hp = build_and_write_history_pool(cfg)
     if hp is not None:
         print(f"[INFO] history pool -> {hp}")
