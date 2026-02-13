@@ -75,57 +75,79 @@ def _parse_date_strict(s: str, field: str) -> pd.Timestamp:
 
 # ------------------------------ airport filter list (CSV) ------------------------------
 
+import csv
+from typing import Optional, Set
+
 def _load_airport_filter_set(cfg: dict) -> Optional[Set[str]]:
     """
-    NEW behavior:
-      - Airport filtering is driven by a CSV file path in config, NOT a JSON list.
-      - Config key: cfg["airports_filter_csv"] (path to CSV)
-      - Optional: cfg["airports_filter_column"] (default "IATA"; if missing, we try first column)
-      - If airports_filter_csv is absent/empty -> no airport filtering.
+    Airport filtering is driven by a CSV-ish file path in config.
 
-    Expected CSV forms:
-      1) With header containing IATA codes column (default column "IATA"), e.g.
-           IATA
-           ATL
-           CLT
-           ...
-      2) Single-column CSV with or without header; we will use the first column.
+    Supports:
+      1) Single line:  "DEN","LAS","MDW",...
+      2) One-per-line: DEN\nLAS\nMDW\n...
+      3) Standard CSV with a column (optionally named by cfg["airports_filter_column"])
     """
     p_raw = (cfg.get("airports_filter_csv") or "").strip()
     if not p_raw:
         return None
 
-    # Treat as repo-relative unless absolute; if you keep it under flightrightdata,
-    # point to it as "../flightrightdata/..." (or use an absolute path).
     p = _abspath(p_raw, base="repo")
     if not p.exists():
         raise FileNotFoundError(f"airports_filter_csv not found: {p}")
 
-    df = pd.read_csv(p, dtype=str)
-
-    if df.empty:
+    # Read raw and parse with csv.reader (robust to your single-line format)
+    text = p.read_text(encoding="utf-8", errors="replace").strip()
+    if not text:
         raise RuntimeError(f"airports_filter_csv is empty: {p}")
 
-    want_col = (cfg.get("airports_filter_column") or "IATA").strip()
-    cols = [str(c).strip() for c in df.columns]
+    # Parse all rows/fields, flatten tokens
+    tokens = []
+    reader = csv.reader([line for line in text.splitlines() if line.strip()], skipinitialspace=True)
+    for row in reader:
+        for cell in row:
+            v = str(cell).strip().strip('"').strip("'").upper()
+            if v:
+                tokens.append(v)
 
-    if want_col in cols:
-        s = df[want_col]
-    else:
-        # Fall back to first column
-        s = df.iloc[:, 0]
+    if not tokens:
+        raise RuntimeError(f"No airport codes found in airports_filter_csv: {p}")
 
-    airports = (
-        s.astype("string")
-        .fillna("")
-        .map(lambda x: str(x).strip().upper())
-    )
-    airports = airports[airports != ""].tolist()
+    # If user provided a column name, we can try to interpret first row as header.
+    # BUT: for your single-line format, there is no header, so we only do this if it looks like a real header.
+    want_col = (cfg.get("airports_filter_column") or "").strip()
+    if want_col:
+        want_col_u = want_col.upper()
+        # Heuristic: if first row contains the header name, treat first row as header
+        # Example header row: IATA, or airport
+        first_line = text.splitlines()[0]
+        if want_col_u in [c.strip().strip('"').strip("'").upper() for c in next(csv.reader([first_line]))]:
+            # Re-parse as table (header + rows)
+            rows = list(csv.reader(text.splitlines(), skipinitialspace=True))
+            header = [h.strip().strip('"').strip("'").upper() for h in rows[0]]
+            try:
+                idx = header.index(want_col_u)
+            except ValueError:
+                raise RuntimeError(f"airports_filter_column={want_col!r} not found in header: {header[:20]}")
+            vals = []
+            for r in rows[1:]:
+                if idx < len(r):
+                    v = str(r[idx]).strip().strip('"').strip("'").upper()
+                    if v:
+                        vals.append(v)
+            if vals:
+                tokens = vals  # override flattened tokens with column-based values
 
+    airports = set(tokens)
     if not airports:
         raise RuntimeError(f"No airport codes found in airports_filter_csv: {p}")
 
-    return set(airports)
+    # Optional sanity check: 3-letter IATA
+    bad = sorted([a for a in airports if len(a) != 3])
+    if bad:
+        print(f"[WARN] airports_filter_csv contains non-3-letter tokens (showing up to 20): {bad[:20]}")
+
+    return airports
+
 
 
 # ------------------------------ BTS canonicalization ------------------------------

@@ -68,7 +68,7 @@
     "thresholds": [15, 30, 45, 60],
     "pos_frac": 0.50,
     "seed": 42,
-    "max_rows": 200000,
+    "max_rows": 20000,
     "output_template": "../flightrightdata/data/processed/train_dep_ge{thr}_balanced_WN_50_23-25.parquet"
   }
 }
