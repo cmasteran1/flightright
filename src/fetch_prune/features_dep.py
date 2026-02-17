@@ -8,7 +8,8 @@ import sys
 import json
 from pathlib import Path
 from datetime import date, timedelta
-from typing import Optional, List
+from typing import Optional, List, Tuple, Dict
+from collections import deque
 
 import numpy as np
 import pandas as pd
@@ -35,6 +36,29 @@ def _format_path_template(p: str, *, target: str, thr: Optional[int] = None) -> 
     return p.format(target=target, thr=thr)
 
 
+# ------------------------------ parquet read helpers (column projection) ------------------------------
+
+def _parquet_columns(path: Path) -> Optional[List[str]]:
+    try:
+        import pyarrow.parquet as pq  # type: ignore
+        pf = pq.ParquetFile(str(path))
+        return list(pf.schema.names)
+    except Exception:
+        return None
+
+
+def _read_parquet_projected(path: Path, want_cols: List[str]) -> pd.DataFrame:
+    cols = _parquet_columns(path)
+    if cols is None:
+        return pd.read_parquet(path)
+
+    keep = [c for c in want_cols if c in cols]
+    if not keep:
+        return pd.read_parquet(path)
+
+    return pd.read_parquet(path, columns=keep)
+
+
 # ---------- holidays ----------
 def _nth_weekday_of_month(year: int, month: int, weekday: int, n: int) -> date:
     d = date(year, month, 1)
@@ -55,20 +79,20 @@ def add_holiday_flag(df: pd.DataFrame, thanksgiving_window: int = 2, christmas_w
     tg = {int(y): thanksgiving_day(int(y)) for y in years}
     xmas = {int(y): date(int(y), 12, 25) for y in years}
 
-    def is_near(d: date, center: date, win: int) -> bool:
-        return abs((d - center).days) <= win
+    def is_near(d0: date, center: date, win: int) -> bool:
+        return abs((d0 - center).days) <= win
 
     flags = []
     for ts in base:
         if pd.isna(ts):
             flags.append(0)
             continue
-        d = ts.date()
-        y = d.year
+        d0 = ts.date()
+        y = d0.year
         f = 0
-        if y in tg and is_near(d, tg[y], thanksgiving_window):
+        if y in tg and is_near(d0, tg[y], thanksgiving_window):
             f = 1
-        if y in xmas and is_near(d, xmas[y], christmas_window):
+        if y in xmas and is_near(d0, xmas[y], christmas_window):
             f = 1
         flags.append(f)
 
@@ -100,7 +124,228 @@ def add_weather_kelvin(df: pd.DataFrame) -> pd.DataFrame:
     return df
 
 
-# ---------- flight-number OD history features (vectorized, from HISTORY POOL) ----------
+# ---------- helper: ensure we have a usable scheduled-departure datetime ----------
+def _ensure_dep_dt(df: pd.DataFrame) -> pd.DataFrame:
+    df = df.copy()
+
+    if "dep_dt_local" in df.columns:
+        df["dep_dt_local"] = pd.to_datetime(df["dep_dt_local"], errors="coerce")
+    else:
+        fd = pd.to_datetime(df.get("FlightDate"), errors="coerce")
+        hhmm = pd.to_numeric(df.get("CRSDepTime"), errors="coerce")
+
+        def _mk(fd0, t0):
+            if pd.isna(fd0) or pd.isna(t0):
+                return pd.NaT
+            try:
+                s = str(int(t0)).zfill(4)
+                hh = int(s[:2])
+                mm = int(s[2:])
+                return pd.Timestamp(fd0.date()) + pd.Timedelta(hours=hh, minutes=mm)
+            except Exception:
+                return pd.NaT
+
+        df["dep_dt_local"] = [_mk(a, b) for a, b in zip(fd.tolist(), hhmm.tolist())]
+
+    dts = pd.to_datetime(df["dep_dt_local"], errors="coerce")
+    df["dep_local_date"] = dts.dt.date
+    return df
+
+
+# ---------- congestion features (±3 hours around scheduled dep), from FULL HISTORY ----------
+
+def _counts_within_window_for_queries(sorted_pool_ns: np.ndarray, sorted_query_ns: np.ndarray, window_ns: int) -> np.ndarray:
+    n_pool = len(sorted_pool_ns)
+    out = np.zeros(len(sorted_query_ns), dtype=np.int32)
+    left = 0
+    right = 0
+    for i, t in enumerate(sorted_query_ns):
+        lo = t - window_ns
+        hi = t + window_ns
+        while left < n_pool and sorted_pool_ns[left] < lo:
+            left += 1
+        if right < left:
+            right = left
+        while right < n_pool and sorted_pool_ns[right] <= hi:
+            right += 1
+        out[i] = max(0, right - left)
+    return out
+
+
+def _build_congestion_time_dicts_from_history(
+    hist: pd.DataFrame,
+) -> Tuple[Dict[Tuple[str, object], np.ndarray], Dict[Tuple[str, str, object], np.ndarray]]:
+    h = hist.copy()
+    h["Origin"] = h.get("Origin", "").astype(str).str.upper().str.strip()
+    h["Reporting_Airline"] = h.get("Reporting_Airline", "").astype(str).str.upper().str.strip()
+
+    if "dep_dt_local" not in h.columns:
+        raise KeyError("History pool must include dep_dt_local for congestion-from-history. Re-run prepare_dataset.py to rebuild history pool with dep_dt_local kept.")
+
+    dep_local = pd.to_datetime(h["dep_dt_local"], errors="coerce")
+    dep_utc = pd.to_datetime(dep_local, errors="coerce", utc=True)
+    dep_ns = dep_utc.astype("int64")  # avoid Series.view FutureWarning
+    valid = dep_ns != np.iinfo("int64").min
+
+    if "dep_local_date" in h.columns:
+        dep_local_date = pd.Series(h["dep_local_date"])
+    else:
+        dep_local_date = dep_local.dt.date
+
+    h2 = pd.DataFrame(
+        {
+            "Origin": h.loc[valid, "Origin"].values,
+            "Reporting_Airline": h.loc[valid, "Reporting_Airline"].values,
+            "dep_local_date": pd.Series(dep_local_date.loc[valid].values),
+            "dep_ns": dep_ns[valid],
+        }
+    )
+
+    h2 = h2.sort_values(["Origin", "dep_local_date", "dep_ns"], kind="mergesort")
+
+    times_by_origin_date: Dict[Tuple[str, object], np.ndarray] = {}
+    for (o, d0), g in h2.groupby(["Origin", "dep_local_date"], sort=False):
+        times_by_origin_date[(o, d0)] = g["dep_ns"].to_numpy(dtype=np.int64, copy=False)
+
+    h3 = h2.sort_values(["Origin", "Reporting_Airline", "dep_local_date", "dep_ns"], kind="mergesort")
+    times_by_origin_airline_date: Dict[Tuple[str, str, object], np.ndarray] = {}
+    for (o, carr, d0), g in h3.groupby(["Origin", "Reporting_Airline", "dep_local_date"], sort=False):
+        times_by_origin_airline_date[(o, carr, d0)] = g["dep_ns"].to_numpy(dtype=np.int64, copy=False)
+
+    return times_by_origin_date, times_by_origin_airline_date
+
+
+def add_congestion_3h_features_from_history(df: pd.DataFrame, hist: pd.DataFrame) -> pd.DataFrame:
+    df = df.copy()
+    df = _ensure_dep_dt(df)
+
+    df["Origin"] = df.get("Origin", "").astype(str).str.upper().str.strip()
+    df["Reporting_Airline"] = df.get("Reporting_Airline", "").astype(str).str.upper().str.strip()
+
+    dep_local = pd.to_datetime(df["dep_dt_local"], errors="coerce")
+    dep_utc = pd.to_datetime(dep_local, errors="coerce", utc=True)
+    dep_ns = dep_utc.astype("int64")  # avoid Series.view FutureWarning
+    valid = dep_ns != np.iinfo("int64").min
+    if "dep_local_date" not in df.columns:
+        df["dep_local_date"] = dep_local.dt.date
+
+    df["origin_congestion_3h_total"] = pd.Series([0] * len(df), index=df.index, dtype="Int16")
+    df["origin_airline_congestion_3h_total"] = pd.Series([0] * len(df), index=df.index, dtype="Int16")
+    if not valid.any():
+        return df
+
+    WINDOW_NS = int(pd.Timedelta(hours=3).value)
+    times_by_origin_date, times_by_origin_airline_date = _build_congestion_time_dicts_from_history(hist)
+
+    work = pd.DataFrame(
+        {
+            "idx": df.index[valid],
+            "Origin": df.loc[valid, "Origin"].values,
+            "Reporting_Airline": df.loc[valid, "Reporting_Airline"].values,
+            "dep_local_date": pd.Series(df.loc[valid, "dep_local_date"].values),
+            "dep_ns": dep_ns[valid],
+        }
+    )
+
+    for (o, d0), g in work.groupby(["Origin", "dep_local_date"], sort=False):
+        pool = times_by_origin_date.get((o, d0))
+        if pool is None or len(pool) == 0:
+            continue
+        g2 = g.sort_values("dep_ns", kind="mergesort")
+        q = g2["dep_ns"].to_numpy(dtype=np.int64, copy=False)
+        counts = _counts_within_window_for_queries(pool, q, WINDOW_NS)
+        counts = np.maximum(0, counts - 1)
+        counts = np.clip(counts, 0, np.iinfo(np.int16).max).astype(np.int16)
+        df.loc[g2["idx"].to_numpy(), "origin_congestion_3h_total"] = pd.Series(counts, index=g2["idx"].to_numpy()).astype("Int16")
+
+    for (o, carr, d0), g in work.groupby(["Origin", "Reporting_Airline", "dep_local_date"], sort=False):
+        pool = times_by_origin_airline_date.get((o, carr, d0))
+        if pool is None or len(pool) == 0:
+            continue
+        g2 = g.sort_values("dep_ns", kind="mergesort")
+        q = g2["dep_ns"].to_numpy(dtype=np.int64, copy=False)
+        counts = _counts_within_window_for_queries(pool, q, WINDOW_NS)
+        counts = np.maximum(0, counts - 1)
+        counts = np.clip(counts, 0, np.iinfo(np.int16).max).astype(np.int16)
+        df.loc[g2["idx"].to_numpy(), "origin_airline_congestion_3h_total"] = pd.Series(counts, index=g2["idx"].to_numpy()).astype("Int16")
+
+    return df
+
+
+# ---------- tail + flight-number temporal features ----------
+def add_tail_and_flightnum_time_features(df: pd.DataFrame) -> pd.DataFrame:
+    df = df.copy()
+    df = _ensure_dep_dt(df)
+
+    df["Origin"] = df.get("Origin", "").astype(str).str.upper().str.strip()
+    df["Dest"] = df.get("Dest", "").astype(str).str.upper().str.strip()
+    df["Reporting_Airline"] = df.get("Reporting_Airline", "").astype(str).str.upper().str.strip()
+
+    tail = df.get("Tail_Number", "").astype(str).str.upper().str.strip()
+    bad_tail = tail.isin(["", "NAN", "NONE", "NULL", "UNKNOWN", "UNKN", "NA"])
+    tail = tail.where(~bad_tail, "")
+    df["Tail_Number"] = tail
+
+    df["Flight_Number_Reporting_Airline"] = pd.to_numeric(df.get("Flight_Number_Reporting_Airline"), errors="coerce")
+
+    dep_utc = pd.to_datetime(df.get("dep_dt_local"), errors="coerce", utc=True)
+    arr_utc = pd.to_datetime(df.get("arr_dt_local"), errors="coerce", utc=True) if "arr_dt_local" in df.columns else pd.to_datetime(pd.Series([pd.NaT] * len(df)), utc=True)
+
+    df["_dep_utc"] = dep_utc
+    df["_arr_utc"] = arr_utc
+
+    dep_local_date = df.get("dep_local_date")
+    if dep_local_date is None:
+        dts = pd.to_datetime(df.get("dep_dt_local"), errors="coerce")
+        dep_local_date = dts.dt.date
+        df["dep_local_date"] = dep_local_date
+
+    valid_tail = df["Tail_Number"].astype(str).str.len() > 0
+    valid_dep = df["_dep_utc"].notna()
+    valid_day = pd.Series(dep_local_date).notna()
+
+    df["tail_leg_num_day"] = pd.Series([pd.NA] * len(df), index=df.index, dtype="Int16")
+    mask_leg = valid_tail & valid_dep & valid_day
+    if mask_leg.any():
+        key = ["Tail_Number", "dep_local_date"]
+        order = df.loc[mask_leg].sort_values(key + ["_dep_utc"]).copy()
+        order["tail_leg_num_day"] = order.groupby(key, sort=False).cumcount() + 1
+        df.loc[order.index, "tail_leg_num_day"] = pd.to_numeric(order["tail_leg_num_day"], errors="coerce").astype("Int16")
+
+    df["flightnum_hours_since_first_departure_today"] = np.nan
+    valid_fn = df["Flight_Number_Reporting_Airline"].notna() & valid_dep & valid_day
+    if valid_fn.any():
+        key = ["Reporting_Airline", "Flight_Number_Reporting_Airline", "dep_local_date"]
+        first_dep = df.loc[valid_fn].groupby(key, sort=False)["_dep_utc"].transform("min")
+        hours = (df.loc[valid_fn, "_dep_utc"] - first_dep).dt.total_seconds() / 3600.0
+        df.loc[valid_fn, "flightnum_hours_since_first_departure_today"] = hours.astype(float)
+
+    df["has_recent_arrival_turn_5h"] = pd.Series(np.zeros(len(df), dtype=np.int8), index=df.index).astype("Int8")
+
+    ok_rows = valid_tail & valid_dep
+    if ok_rows.any():
+        w = df.loc[ok_rows, ["Tail_Number", "Origin", "Dest", "_dep_utc", "_arr_utc"]].copy()
+        w = w.sort_values(["Tail_Number", "_dep_utc"])
+
+        w["prev_arr_utc"] = w.groupby("Tail_Number", sort=False)["_arr_utc"].shift(1)
+        w["prev_dest"] = w.groupby("Tail_Number", sort=False)["Dest"].shift(1)
+
+        gap_h = (w["_dep_utc"] - w["prev_arr_utc"]).dt.total_seconds() / 3600.0
+        cond = (
+            w["prev_arr_utc"].notna()
+            & w["prev_dest"].notna()
+            & (w["prev_dest"].astype(str).str.upper() == w["Origin"].astype(str).str.upper())
+            & (gap_h >= 0.0)
+            & (gap_h <= 5.0)
+        )
+
+        df.loc[w.index, "has_recent_arrival_turn_5h"] = pd.Series(cond.astype(np.int8).values, index=w.index).astype("Int8")
+
+    df = df.drop(columns=["_dep_utc", "_arr_utc"], errors="ignore")
+    return df
+
+
+# ---------- flight-number OD history features (FAST, no apply/concat) ----------
 def add_recent_flightnum_od_mean_from_history(
     df: pd.DataFrame,
     hist: pd.DataFrame,
@@ -109,100 +354,193 @@ def add_recent_flightnum_od_mean_from_history(
     low_support_leq: int = 2,
 ) -> pd.DataFrame:
     df = df.copy()
-
     key = ["Reporting_Airline", "Flight_Number_Reporting_Airline", "Origin", "Dest"]
 
     for c in ["Reporting_Airline", "Origin", "Dest"]:
         if c in df.columns:
-            df[c] = df[c].astype(str).str.upper()
+            df[c] = df[c].astype(str).str.upper().str.strip()
     df["Flight_Number_Reporting_Airline"] = pd.to_numeric(df.get("Flight_Number_Reporting_Airline"), errors="coerce")
-    df["FlightDate"] = pd.to_datetime(df["FlightDate"], errors="coerce").dt.normalize()
+    df["FlightDate"] = pd.to_datetime(df.get("FlightDate"), errors="coerce").dt.normalize()
 
     hist = hist.copy()
     for c in ["Reporting_Airline", "Origin", "Dest"]:
         if c in hist.columns:
-            hist[c] = hist[c].astype(str).str.upper()
+            hist[c] = hist[c].astype(str).str.upper().str.strip()
     hist["Flight_Number_Reporting_Airline"] = pd.to_numeric(hist.get("Flight_Number_Reporting_Airline"), errors="coerce")
-    hist["FlightDate"] = pd.to_datetime(hist["FlightDate"], errors="coerce").dt.normalize()
+    hist["FlightDate"] = pd.to_datetime(hist.get("FlightDate"), errors="coerce").dt.normalize()
     hist["DepDelayMinutes"] = pd.to_numeric(hist.get("DepDelayMinutes"), errors="coerce")
 
-    need_cols = ["FlightDate"] + key + ["DepDelayMinutes"]
-    df_small = df[need_cols].copy()
-    hist_small = hist[need_cols].copy()
+    # Ensure dep_dt_local is available for stable ordering within day (if not, fall back to 0)
+    need_df = ["FlightDate"] + key + ["DepDelayMinutes", "dep_dt_local"]
+    need_hist = ["FlightDate"] + key + ["DepDelayMinutes", "dep_dt_local"]
+    need_df = [c for c in need_df if c in df.columns]
+    need_hist = [c for c in need_hist if c in hist.columns]
 
-    df_small["_is_target"] = True
-    hist_small["_is_target"] = False
+    df_small = df[need_df].copy()
+    hist_small = hist[need_hist].copy()
 
-    all_rows = pd.concat([hist_small, df_small], ignore_index=True)
-    all_rows = all_rows.dropna(subset=["FlightDate"] + key).copy()
-    all_rows = all_rows.sort_values(key + ["FlightDate"]).reset_index(drop=True)
+    # Drop missing key/date
+    df_small = df_small.dropna(subset=["FlightDate"] + key).copy()
+    hist_small = hist_small.dropna(subset=["FlightDate"] + key).copy()
 
-    def _roll_mean_lastN(g: pd.DataFrame) -> pd.Series:
-        s = g["DepDelayMinutes"]
-        out = s.shift(1).rolling(window=int(n_recent), min_periods=1).mean()
-        out.index = g.index
-        return out
+    def _time_i8(frame: pd.DataFrame) -> np.ndarray:
+        if "dep_dt_local" in frame.columns:
+            t = pd.to_datetime(frame["dep_dt_local"], errors="coerce", utc=True)
+            out = t.astype("int64")
+            out = np.where(out == np.iinfo("int64").min, 0, out)
+            return out.astype(np.int64, copy=False)
+        return np.zeros(len(frame), dtype=np.int64)
 
-    all_rows["flightnum_od_depdelay_mean_lastN"] = (
-        all_rows.groupby(key, sort=False, group_keys=False).apply(_roll_mean_lastN)
-    )
+    df_small["_t"] = _time_i8(df_small)
+    hist_small["_t"] = _time_i8(hist_small)
 
-    def _roll_support_lastNd(g: pd.DataFrame) -> pd.Series:
-        tmp = pd.DataFrame({"FlightDate": g["FlightDate"].values}, index=g.index)
-        tmp["ind"] = 1.0
-        s = tmp.set_index("FlightDate")["ind"]
-        rolled = s.shift(1).rolling(f"{int(n_days)}D", min_periods=0).sum()
-        tmp2 = tmp.copy()
-        tmp2["support"] = rolled.to_numpy()
-        out = pd.Series(tmp2["support"].values, index=tmp2.index)
-        return out
+    sort_cols = key + ["FlightDate", "_t"]
+    df_small = df_small.sort_values(sort_cols, kind="mergesort")
+    hist_small = hist_small.sort_values(sort_cols, kind="mergesort")
 
-    all_rows["flightnum_od_support_count_lastNd"] = (
-        all_rows.groupby(key, sort=False, group_keys=False).apply(_roll_support_lastNd)
-    )
+    out_mean = pd.Series(np.nan, index=df.index, dtype="float64")
+    out_supp = pd.Series(np.zeros(len(df), dtype=np.int16), index=df.index, dtype="Int16")
+    out_low = pd.Series(np.ones(len(df), dtype=np.int8), index=df.index, dtype="Int8")
 
-    supp = pd.to_numeric(all_rows["flightnum_od_support_count_lastNd"], errors="coerce").fillna(0).astype(np.int32)
-    all_rows["flightnum_od_support_count_lastNd"] = supp.astype(np.int16)
+    hist_groups: Dict[Tuple, Tuple[np.ndarray, np.ndarray, np.ndarray]] = {}
+    if not hist_small.empty:
+        h_dates = hist_small["FlightDate"].to_numpy()
+        h_date_int = h_dates.astype("datetime64[D]").astype(np.int32)
+        h_t = hist_small["_t"].to_numpy(dtype=np.int64, copy=False)
+        h_delay = pd.to_numeric(hist_small["DepDelayMinutes"], errors="coerce").to_numpy(dtype=np.float32, copy=False)
 
-    all_rows["flightnum_od_low_support"] = (
-        all_rows["flightnum_od_support_count_lastNd"] <= int(low_support_leq)
-    ).astype(np.int8)
+        h_key_df = hist_small[key]
+        h_key_vals = [h_key_df[c].to_numpy() for c in key]
 
-    feats = all_rows[all_rows["_is_target"]][
-        ["FlightDate"] + key + [
-            "flightnum_od_depdelay_mean_lastN",
-            "flightnum_od_support_count_lastNd",
-            "flightnum_od_low_support",
-        ]
-    ].copy()
+        n = len(hist_small)
+        if n > 0:
+            starts = [0]
+            for i in range(1, n):
+                changed = False
+                for arr in h_key_vals:
+                    if arr[i] != arr[i - 1]:
+                        changed = True
+                        break
+                if changed:
+                    starts.append(i)
+            starts.append(n)
 
-    df = df.merge(feats, on=["FlightDate"] + key, how="left")
+            def _key_at(i: int) -> Tuple:
+                return tuple(arr[i] for arr in h_key_vals)
 
-    df["flightnum_od_support_count_lastNd"] = (
-        pd.to_numeric(df["flightnum_od_support_count_lastNd"], errors="coerce")
-        .fillna(0)
-        .astype("Int16")
-    )
-    df["flightnum_od_low_support"] = (
-        pd.to_numeric(df["flightnum_od_low_support"], errors="coerce")
-        .fillna(1)
-        .astype("Int8")
-    )
+            for a, b in zip(starts[:-1], starts[1:]):
+                k = _key_at(a)
+                hist_groups[k] = (h_date_int[a:b], h_t[a:b], h_delay[a:b])
 
+    if df_small.empty:
+        df["flightnum_od_depdelay_mean_lastN"] = out_mean
+        df["flightnum_od_support_count_lastNd"] = out_supp
+        df["flightnum_od_low_support"] = out_low
+        return df
+
+    d_dates = df_small["FlightDate"].to_numpy()
+    d_date_int = d_dates.astype("datetime64[D]").astype(np.int32)
+    d_t = df_small["_t"].to_numpy(dtype=np.int64, copy=False)
+    d_delay = pd.to_numeric(df_small.get("DepDelayMinutes"), errors="coerce").to_numpy(dtype=np.float32, copy=False)
+    d_idx = df_small.index.to_numpy()
+
+    d_key_df = df_small[key]
+    d_key_vals = [d_key_df[c].to_numpy() for c in key]
+    ndf = len(df_small)
+
+    starts = [0]
+    for i in range(1, ndf):
+        changed = False
+        for arr in d_key_vals:
+            if arr[i] != arr[i - 1]:
+                changed = True
+                break
+        if changed:
+            starts.append(i)
+    starts.append(ndf)
+
+    def _df_key_at(i: int) -> Tuple:
+        return tuple(arr[i] for arr in d_key_vals)
+
+    for a, b in zip(starts[:-1], starts[1:]):
+        k = _df_key_at(a)
+
+        df_dates_i = d_date_int[a:b]
+        df_t_i = d_t[a:b]
+        df_delay_i = d_delay[a:b]
+        df_idx_i = d_idx[a:b]
+
+        h = hist_groups.get(k)
+        if h is None:
+            h_dates_i = np.empty(0, dtype=np.int32)
+            h_t_i = np.empty(0, dtype=np.int64)
+            h_delay_i = np.empty(0, dtype=np.float32)
+        else:
+            h_dates_i, h_t_i, h_delay_i = h
+
+        i_hist = 0
+        i_df = 0
+        n_hist = len(h_dates_i)
+        n_df_g = len(df_dates_i)
+
+        lastN = deque(maxlen=int(n_recent))
+        lastNd_dates = deque()
+
+        def _advance_window(current_date_int: int):
+            cutoff = current_date_int - int(n_days)
+            while lastNd_dates and lastNd_dates[0] < cutoff:
+                lastNd_dates.popleft()
+
+        while i_df < n_df_g:
+            next_df_date = int(df_dates_i[i_df])
+            next_df_t = int(df_t_i[i_df])
+
+            while i_hist < n_hist:
+                hd = int(h_dates_i[i_hist])
+                ht = int(h_t_i[i_hist])
+                if (hd < next_df_date) or (hd == next_df_date and ht < next_df_t):
+                    delayv = float(h_delay_i[i_hist])
+                    if np.isfinite(delayv):
+                        lastN.append(delayv)
+                    lastNd_dates.append(hd)
+                    i_hist += 1
+                else:
+                    break
+
+            _advance_window(next_df_date)
+
+            if len(lastN) > 0:
+                out_mean.loc[df_idx_i[i_df]] = float(np.mean(np.fromiter(lastN, dtype=np.float32)))
+            else:
+                out_mean.loc[df_idx_i[i_df]] = np.nan
+
+            supp = int(len(lastNd_dates))
+            out_supp.loc[df_idx_i[i_df]] = np.int16(min(supp, np.iinfo(np.int16).max))
+            out_low.loc[df_idx_i[i_df]] = np.int8(1 if supp <= int(low_support_leq) else 0)
+
+            dv = float(df_delay_i[i_df]) if np.isfinite(df_delay_i[i_df]) else np.nan
+            if np.isfinite(dv):
+                lastN.append(dv)
+            lastNd_dates.append(next_df_date)
+
+            i_df += 1
+
+    df["flightnum_od_depdelay_mean_lastN"] = pd.to_numeric(out_mean, errors="coerce")
+    df["flightnum_od_support_count_lastNd"] = pd.to_numeric(out_supp, errors="coerce").fillna(0).astype("Int16")
+    df["flightnum_od_low_support"] = pd.to_numeric(out_low, errors="coerce").fillna(1).astype("Int8")
     return df
 
 
-# ---------- carrier baselines (dep delay, daily rolling) from HISTORY POOL ----------
 def add_carrier_dep_delay_baselines_from_history(df: pd.DataFrame, hist: pd.DataFrame, n_days: int = 14) -> pd.DataFrame:
     df = df.copy()
     df["FlightDate"] = pd.to_datetime(df["FlightDate"], errors="coerce").dt.normalize()
-    df["Reporting_Airline"] = df["Reporting_Airline"].astype(str).str.upper()
-    df["Origin"] = df["Origin"].astype(str).str.upper()
+    df["Reporting_Airline"] = df["Reporting_Airline"].astype(str).str.upper().str.strip()
+    df["Origin"] = df["Origin"].astype(str).str.upper().str.strip()
 
     hist = hist.copy()
     hist["FlightDate"] = pd.to_datetime(hist["FlightDate"], errors="coerce").dt.normalize()
-    hist["Reporting_Airline"] = hist["Reporting_Airline"].astype(str).str.upper()
-    hist["Origin"] = hist["Origin"].astype(str).str.upper()
+    hist["Reporting_Airline"] = hist["Reporting_Airline"].astype(str).str.upper().str.strip()
+    hist["Origin"] = hist["Origin"].astype(str).str.upper().str.strip()
     hist["DepDelayMinutes"] = pd.to_numeric(hist.get("DepDelayMinutes"), errors="coerce")
 
     carr = hist.dropna(subset=["Reporting_Airline", "FlightDate", "DepDelayMinutes"]).copy()
@@ -243,7 +581,6 @@ def add_carrier_dep_delay_baselines_from_history(df: pd.DataFrame, hist: pd.Data
     return df
 
 
-# ---------- turn-time proxy ----------
 def add_turn_time_hours(df: pd.DataFrame) -> pd.DataFrame:
     df = df.copy()
     df["Flight_Number_Reporting_Airline"] = pd.to_numeric(df.get("Flight_Number_Reporting_Airline"), errors="coerce")
@@ -263,7 +600,6 @@ def add_turn_time_hours(df: pd.DataFrame) -> pd.DataFrame:
     return df
 
 
-# ---------- labels ----------
 def add_dep_labels_for_thresholds(df: pd.DataFrame, thresholds: List[int], delay_col: str = "DepDelayMinutes") -> pd.DataFrame:
     df = df.copy()
     d = pd.to_numeric(df.get(delay_col), errors="coerce").fillna(0.0)
@@ -333,8 +669,31 @@ def main():
     if not in_path.exists():
         raise FileNotFoundError(f"Enriched parquet not found: {in_path}")
 
+    df_cols_want = [
+        "FlightDate",
+        "Origin",
+        "Dest",
+        "Reporting_Airline",
+        "Flight_Number_Reporting_Airline",
+        "CRSDepTime",
+        "dep_dt_local",
+        "arr_dt_local",
+        "DepDelayMinutes",
+        "Tail_Number",
+        "aircraft_type",
+        "origin_temperature_2m_max",
+        "origin_temperature_2m_min",
+        "origin_precipitation_sum",
+        "origin_windspeed_10m_max",
+        "origin_weathercode",
+        "origin_dep_temperature_2m",
+        "origin_dep_precipitation",
+        "origin_dep_windspeed_10m",
+        "origin_dep_weathercode",
+    ]
+
     print(f"[INFO] reading enriched -> {in_path}")
-    df = pd.read_parquet(in_path)
+    df = _read_parquet_projected(in_path, df_cols_want)
 
     hist_path_cfg = cfg.get("history_output_path", "intermediate/history_pool_dep.parquet")
     hist_path = _abspath(_format_path_template(hist_path_cfg, target=target), base="data")
@@ -343,10 +702,30 @@ def main():
             f"History pool parquet not found: {hist_path}\n"
             "Run prepare_dataset.py with history_output_path enabled, or set cfg.history_output_path correctly."
         )
-    hist = pd.read_parquet(hist_path)
 
-    df["Origin"] = df["Origin"].astype(str).str.upper()
-    df["Dest"] = df["Dest"].astype(str).str.upper()
+    hist_cols_want = [
+        "FlightDate",
+        "Origin",
+        "Dest",
+        "Reporting_Airline",
+        "Flight_Number_Reporting_Airline",
+        "DepDelayMinutes",
+        "CRSDepTime",
+        "dep_dt_local",
+        "dep_local_date",
+    ]
+    hist = _read_parquet_projected(hist_path, hist_cols_want)
+
+    df["FlightDate"] = pd.to_datetime(df.get("FlightDate"), errors="coerce")
+    df["Origin"] = df.get("Origin", "").astype(str).str.upper().str.strip()
+    df["Dest"] = df.get("Dest", "").astype(str).str.upper().str.strip()
+    df["Reporting_Airline"] = df.get("Reporting_Airline", "").astype(str).str.upper().str.strip()
+
+    hist["FlightDate"] = pd.to_datetime(hist.get("FlightDate"), errors="coerce")
+    hist["Origin"] = hist.get("Origin", "").astype(str).str.upper().str.strip()
+    hist["Dest"] = hist.get("Dest", "").astype(str).str.upper().str.strip()
+    hist["Reporting_Airline"] = hist.get("Reporting_Airline", "").astype(str).str.upper().str.strip()
+
     df["od_pair"] = df["Origin"] + "_" + df["Dest"]
 
     if "dep_dt_local" in df.columns:
@@ -376,6 +755,11 @@ def main():
 
     df = add_weather_kelvin(df)
 
+    # congestion (from FULL history pool; no extra pool file)
+    df = add_congestion_3h_features_from_history(df, hist)
+
+    df = add_tail_and_flightnum_time_features(df)
+
     n_recent = int(feat_cfg.get("n_recent_flightnum_od", 20))
     n_days_hist = int(feat_cfg.get("n_days_flightnum_od", 14))
     low_support_leq = int(feat_cfg.get("low_support_leq", 2))
@@ -397,7 +781,6 @@ def main():
     delay_col = (cfg.get("balance", {}) or {}).get("delay_col", "DepDelayMinutes")
     df = add_dep_labels_for_thresholds(df, thresholds, delay_col=delay_col)
 
-    # default is now DATA_ROOT-relative
     out_feat_cfg = cfg.get("output_features_unbalanced_path", "processed/features_dep_unbalanced.parquet")
     out_feat_cfg = _format_path_template(out_feat_cfg, target=target)
     out_feat_path = _abspath(out_feat_cfg, base="data")
@@ -426,7 +809,6 @@ def main():
         eval_df = df[eval_mask].copy()
         train_pool = df[~eval_mask].copy()
 
-        # default is now DATA_ROOT-relative
         eval_out = eval_cfg.get("output_path", "processed/eval_dep_unbalanced.parquet")
         eval_out = _format_path_template(eval_out, target=target)
         eval_path = _abspath(eval_out, base="data")
@@ -442,7 +824,6 @@ def main():
     max_rows = fb.get("max_rows")
     max_rows = int(max_rows) if max_rows is not None else None
 
-    # default is now DATA_ROOT-relative
     out_tmpl = fb.get("output_template", "processed/train_{target}_ge{thr}_balanced.parquet")
 
     for thr in thr_list:
