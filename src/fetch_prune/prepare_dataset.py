@@ -51,8 +51,6 @@ def _expand_inputs(patterns: List[str]) -> List[Path]:
     files: List[Path] = []
     seen = set()
     for pat in patterns:
-        # Inputs: treat as repo-relative unless the user puts them elsewhere explicitly.
-        # If you want inputs to default under flightrightdata too, change base="repo" -> base="data".
         full = str(_abspath(pat, base="repo"))
         hits = sorted(glob.glob(full))
         for h in hits:
@@ -266,7 +264,6 @@ def _mk_local_dt(flight_date: pd.Timestamp, hhmm, tz_name: str):
         s = str(int(hhmm)).zfill(4)
         hh = int(s[:2])
         mm = int(s[2:])
-        # NOTE: using ZoneInfo directly; ambiguous times default to fold=0 without raising.
         return datetime.combine(flight_date.date(), dtime(hh, mm)).replace(tzinfo=ZoneInfo(tz_name))
     except Exception:
         return None
@@ -285,7 +282,6 @@ def add_timezone_local_times(df: pd.DataFrame, airports_meta: Dict[str, Tuple[fl
         dep_dt = _mk_local_dt(getattr(r, "FlightDate"), getattr(r, "CRSDepTime"), getattr(r, "Origin_TZ"))
         arr_dt = _mk_local_dt(getattr(r, "FlightDate"), getattr(r, "CRSArrTime"), getattr(r, "Dest_TZ"))
 
-        # overnight arrival (same schedule date but arrives after midnight local)
         if dep_dt and arr_dt:
             try:
                 dep_hhmm = getattr(r, "CRSDepTime")
@@ -309,22 +305,16 @@ def _add_dep_dt_local_for_history_pool(
     hist: pd.DataFrame,
     airports_meta: Dict[str, Tuple[float, float, str]],
 ) -> pd.DataFrame:
-    """
-    For history pool only: compute dep_dt_local + dep_local_date using FlightDate + CRSDepTime + Origin timezone.
-    This does NOT require Dest/CRSArrTime.
-    """
     h = hist.copy()
     h["Origin"] = h["Origin"].astype(str).str.upper()
     h["FlightDate"] = pd.to_datetime(h["FlightDate"], errors="coerce")
     if "CRSDepTime" in h.columns:
         h["CRSDepTime"] = pd.to_numeric(h["CRSDepTime"], errors="coerce")
     else:
-        # Without CRSDepTime we cannot compute local scheduled departure time
         h["dep_dt_local"] = pd.NaT
         h["dep_local_date"] = pd.NaT
         return h
 
-    # map origin -> tz
     tz_map = {k: v[2] for k, v in airports_meta.items()}
 
     dep_locals = []
@@ -341,13 +331,6 @@ def _add_dep_dt_local_for_history_pool(
 # ------------------------------ HTTP helper ------------------------------
 
 def _req_with_backoff(url, params, max_tries=8):
-    """
-    Requests with exponential backoff.
-
-    Improvements vs prior:
-      - If HTTP 429 includes Retry-After header, honor it.
-      - More retries by default for Open-Meteo archive bursts.
-    """
     import requests
     import time as _time
 
@@ -483,12 +466,6 @@ HOURLY_WEATHER_VARS = [
 ]
 
 def _fetch_hourly_weather(lat, lon, start, end, tz):
-    """
-    Fetch hourly weather from Open-Meteo archive.
-    Returns DataFrame with:
-      - hour_utc (tz-naive datetime64[ns] representing the UTC hour)
-      - origin_dep_<var> columns for vars in HOURLY_WEATHER_VARS
-    """
     url = "https://archive-api.open-meteo.com/v1/archive"
     r = _req_with_backoff(
         url,
@@ -498,7 +475,7 @@ def _fetch_hourly_weather(lat, lon, start, end, tz):
             "start_date": start,
             "end_date": end,
             "hourly": ",".join(HOURLY_WEATHER_VARS),
-            "timezone": tz,  # IMPORTANT: interpret time in local tz for that airport
+            "timezone": tz,
         },
     )
     payload = r.json()
@@ -508,15 +485,7 @@ def _fetch_hourly_weather(lat, lon, start, end, tz):
         return pd.DataFrame(columns=cols)
 
     h = pd.DataFrame(hourly)
-
-    # Parse hourly['time'] as timezone-aware in the requested tz, then convert to UTC hour key.
-    # Open-Meteo returns "YYYY-MM-DDTHH:MM" strings in the specified timezone.
-    # IMPORTANT: DO NOT tz_localize with ambiguous="infer" on DST fall-back days; it can raise.
-    # Instead, rely on the fact Open-Meteo time strings already represent local civil time sequence.
-    # We will localize with ambiguous="NaT" (safe), then drop NaT rows.
     t_local = pd.to_datetime(h["time"], errors="coerce")
-
-    # Use tz_localize with ambiguous="NaT" to avoid AmbiguousTimeError; drop those ambiguous rows.
     t_local = t_local.dt.tz_localize(tz, ambiguous="NaT", nonexistent="shift_forward")
     t_local = t_local.dropna()
 
@@ -530,30 +499,18 @@ def _fetch_hourly_weather(lat, lon, start, end, tz):
 
 
 def add_origin_weather_hourly_at_dep(df, airports_meta: Dict[str, Tuple[float, float, str]], cache_dir: str):
-    """
-    Adds origin departure-hour weather columns:
-      - origin_dep_temperature_2m
-      - origin_dep_precipitation
-      - origin_dep_windspeed_10m
-      - origin_dep_weathercode
-
-    Merge key is (Origin, dep_hour_utc) where dep_hour_utc is tz-naive UTC hour.
-    """
     df = df.copy()
     df["FlightDate"] = pd.to_datetime(df["FlightDate"], errors="coerce")
 
-    # Need dep_dt_local from upstream
     if "dep_dt_local" not in df.columns:
         raise KeyError("add_origin_weather_hourly_at_dep requires dep_dt_local column (run add_timezone_local_times first).")
 
-    # Canonical join key: UTC hour (tz-naive)
     dep_utc = pd.to_datetime(df["dep_dt_local"], errors="coerce", utc=True)
     df["_dep_hour_utc"] = dep_utc.dt.floor("h").dt.tz_localize(None)
 
     cache_dir = _abspath(cache_dir, base="data")
     cache_dir.mkdir(parents=True, exist_ok=True)
 
-    # Use FlightDate bounds (calendar days) for API range
     start = df["FlightDate"].min().strftime("%Y-%m-%d")
     end = df["FlightDate"].max().strftime("%Y-%m-%d")
 
@@ -806,12 +763,14 @@ def add_aircraft_type_from_faa_registry(df: pd.DataFrame, cfg: dict) -> pd.DataF
 def build_and_write_history_pool(cfg: dict) -> Optional[Path]:
     """
     History pool is written unbalanced; features_dep.py uses it for lag features.
-    We now ALSO compute/keep:
-      - dep_dt_local
-      - dep_local_date
-    so congestion can be computed from the full history pool without any extra "pool" parquet.
 
-    IMPORTANT: This is an EXTENSION of the existing history pool; no separate congestion pool file.
+    This pool must contain enough columns to compute rolling features later:
+      - FlightDate
+      - DepDelayMinutes
+      - Origin
+      - Reporting_Airline
+      - Flight_Number_Reporting_Airline
+      - CRSDepTime + dep_dt_local for stable ordering (and congestion)
     """
     hist_paths = cfg.get("history_flights_path") or cfg.get("input_flights_path")
     if not hist_paths:
@@ -848,7 +807,6 @@ def build_and_write_history_pool(cfg: dict) -> Optional[Path]:
     if "DepDel15" not in hist.columns and "DepDelayMinutes" in hist.columns:
         hist["DepDel15"] = (pd.to_numeric(hist["DepDelayMinutes"], errors="coerce") >= 15).astype("Int8")
 
-    # ---- NEW: compute dep_dt_local + dep_local_date for history pool ----
     airports_csv = cfg.get("airports_csv", "data/meta/airports.csv")
     airports_csv_resolved = _abspath(airports_csv, base="repo")
     meta_df = load_airport_meta(airports_csv)
@@ -869,7 +827,6 @@ def build_and_write_history_pool(cfg: dict) -> Optional[Path]:
         "Flight_Number_Reporting_Airline",
         "DepDelayMinutes",
         "DepDel15",
-        # NEW kept fields (extended history pool, not a new temp file)
         "CRSDepTime",
         "dep_dt_local",
         "dep_local_date",
@@ -902,17 +859,14 @@ def main():
     meta_df = load_airport_meta(airports_csv)
     print(f"[INFO] airports_csv -> {airports_csv_resolved}  (exists={airports_csv_resolved.exists()})")
 
-    # load raw
     df = read_input_parquet(cfg["input_flights_path"])
     df = canonicalize_bts_columns(df)
 
-    # normalize types
     df["FlightDate"] = pd.to_datetime(df["FlightDate"], errors="coerce")
     for c in ["CRSDepTime", "CRSArrTime", "DepDelayMinutes", "ArrDelayMinutes", "DepDel15", "ArrDel15"]:
         if c in df.columns:
             df[c] = pd.to_numeric(df[c], errors="coerce")
 
-    # filters
     airports = _load_airport_filter_set(cfg)
     if airports is not None:
         df["Origin"] = df["Origin"].astype(str).str.upper()
@@ -932,7 +886,6 @@ def main():
     if df.empty:
         raise RuntimeError("No rows after filtering (airports/airlines/date range).")
 
-    # validate tz ONLY for airports present after filtering (needed airports)
     needed_iata = sorted(pd.unique(pd.concat([df["Origin"], df["Dest"]]).astype(str).str.upper()))
     airports_meta = _validate_tz_strings_for_needed(
         meta_df,
@@ -940,32 +893,26 @@ def main():
         airports_csv_for_msg=airports_csv_resolved,
     )
 
-    # local scheduled times
     df = add_timezone_local_times(df, airports_meta=airports_meta)
 
-    # FAA aircraft type (local files; no network)
     if bool(cfg.get("add_aircraft_type", True)):
         df = add_aircraft_type_from_faa_registry(df, cfg)
     else:
         if "aircraft_type" not in df.columns:
             df["aircraft_type"] = "Unknown"
 
-    # optional aircraft age
     if bool(cfg.get("add_aircraft_age", True)):
         df = add_aircraft_age(df, reg_csv=cfg.get("aircraft_registry_csv", "data/aircraft_registry_clean.csv"))
 
-    # weather (daily origin only)
     weather_cfg = cfg.get("weather") or {}
     if bool(weather_cfg.get("daily", True)):
         cache_dir = weather_cfg.get("cache_dir", "weather_cache")
         df = add_origin_weather_daily(df, airports_meta=airports_meta, cache_dir=cache_dir)
 
-    # hourly weather at scheduled departure hour (origin only)
     if bool(weather_cfg.get("hourly_at_dep", True)):
         hourly_cache_dir = weather_cfg.get("hourly_cache_dir", "weather_cache_hourly")
         df = add_origin_weather_hourly_at_dep(df, airports_meta=airports_meta, cache_dir=hourly_cache_dir)
 
-    # write enriched unbalanced
     out_enriched = cfg.get("output_enriched_unbalanced_path", "intermediate/enriched_{target}_unbalanced.parquet")
     out_enriched = _format_path_template(out_enriched, target=target)
     out_path = _abspath(out_enriched, base="data")
@@ -973,7 +920,6 @@ def main():
     df.to_parquet(out_path, index=False)
     print(f"[OK] wrote enriched unbalanced rows={len(df)} -> {out_path}")
 
-    # history pool (optional, but recommended for lag features)
     hp = build_and_write_history_pool(cfg)
     if hp is not None:
         print(f"[INFO] history pool -> {hp}")

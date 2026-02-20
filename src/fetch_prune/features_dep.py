@@ -184,7 +184,7 @@ def _build_congestion_time_dicts_from_history(
 
     dep_local = pd.to_datetime(h["dep_dt_local"], errors="coerce")
     dep_utc = pd.to_datetime(dep_local, errors="coerce", utc=True)
-    dep_ns = dep_utc.astype("int64")  # avoid Series.view FutureWarning
+    dep_ns = dep_utc.astype("int64")
     valid = dep_ns != np.iinfo("int64").min
 
     if "dep_local_date" in h.columns:
@@ -224,7 +224,7 @@ def add_congestion_3h_features_from_history(df: pd.DataFrame, hist: pd.DataFrame
 
     dep_local = pd.to_datetime(df["dep_dt_local"], errors="coerce")
     dep_utc = pd.to_datetime(dep_local, errors="coerce", utc=True)
-    dep_ns = dep_utc.astype("int64")  # avoid Series.view FutureWarning
+    dep_ns = dep_utc.astype("int64")
     valid = dep_ns != np.iinfo("int64").min
     if "dep_local_date" not in df.columns:
         df["dep_local_date"] = dep_local.dt.date
@@ -345,15 +345,32 @@ def add_tail_and_flightnum_time_features(df: pd.DataFrame) -> pd.DataFrame:
     return df
 
 
-# ---------- flight-number OD history features (FAST, no apply/concat) ----------
-def add_recent_flightnum_od_mean_from_history(
+# ---------- NEW: flight-number OD rolling means over last {7,14,21,28} days ----------
+def add_flightnum_od_depdelay_means_from_history(
     df: pd.DataFrame,
     hist: pd.DataFrame,
+    windows_days: List[int],
+    *,
     n_recent: int = 20,
-    n_days: int = 14,
     low_support_leq: int = 2,
 ) -> pd.DataFrame:
+    """
+    Produces features:
+      - flightnum_od_depdelay_mean_last{W}  for W in windows_days (calendar-day windows)
+      - flightnum_od_support_count_last{Wmax}d
+      - flightnum_od_low_support_last{Wmax}d
+
+    IMPORTANT:
+      - uses strictly PRIOR observations (no leakage) by processing in time order and only
+        adding current-row delay AFTER computing features for that row.
+      - windowed means are over the last W calendar days (not last W flights).
+    """
     df = df.copy()
+    windows = sorted({int(w) for w in windows_days if int(w) > 0})
+    if not windows:
+        return df
+    wmax = int(max(windows))
+
     key = ["Reporting_Airline", "Flight_Number_Reporting_Airline", "Origin", "Dest"]
 
     for c in ["Reporting_Airline", "Origin", "Dest"]:
@@ -370,7 +387,6 @@ def add_recent_flightnum_od_mean_from_history(
     hist["FlightDate"] = pd.to_datetime(hist.get("FlightDate"), errors="coerce").dt.normalize()
     hist["DepDelayMinutes"] = pd.to_numeric(hist.get("DepDelayMinutes"), errors="coerce")
 
-    # Ensure dep_dt_local is available for stable ordering within day (if not, fall back to 0)
     need_df = ["FlightDate"] + key + ["DepDelayMinutes", "dep_dt_local"]
     need_hist = ["FlightDate"] + key + ["DepDelayMinutes", "dep_dt_local"]
     need_df = [c for c in need_df if c in df.columns]
@@ -379,7 +395,6 @@ def add_recent_flightnum_od_mean_from_history(
     df_small = df[need_df].copy()
     hist_small = hist[need_hist].copy()
 
-    # Drop missing key/date
     df_small = df_small.dropna(subset=["FlightDate"] + key).copy()
     hist_small = hist_small.dropna(subset=["FlightDate"] + key).copy()
 
@@ -398,10 +413,12 @@ def add_recent_flightnum_od_mean_from_history(
     df_small = df_small.sort_values(sort_cols, kind="mergesort")
     hist_small = hist_small.sort_values(sort_cols, kind="mergesort")
 
-    out_mean = pd.Series(np.nan, index=df.index, dtype="float64")
+    # output columns
+    out_means = {w: pd.Series(np.nan, index=df.index, dtype="float64") for w in windows}
     out_supp = pd.Series(np.zeros(len(df), dtype=np.int16), index=df.index, dtype="Int16")
     out_low = pd.Series(np.ones(len(df), dtype=np.int8), index=df.index, dtype="Int8")
 
+    # build grouped history arrays
     hist_groups: Dict[Tuple, Tuple[np.ndarray, np.ndarray, np.ndarray]] = {}
     if not hist_small.empty:
         h_dates = hist_small["FlightDate"].to_numpy()
@@ -411,8 +428,8 @@ def add_recent_flightnum_od_mean_from_history(
 
         h_key_df = hist_small[key]
         h_key_vals = [h_key_df[c].to_numpy() for c in key]
-
         n = len(hist_small)
+
         if n > 0:
             starts = [0]
             for i in range(1, n):
@@ -433,9 +450,10 @@ def add_recent_flightnum_od_mean_from_history(
                 hist_groups[k] = (h_date_int[a:b], h_t[a:b], h_delay[a:b])
 
     if df_small.empty:
-        df["flightnum_od_depdelay_mean_lastN"] = out_mean
-        df["flightnum_od_support_count_lastNd"] = out_supp
-        df["flightnum_od_low_support"] = out_low
+        for w in windows:
+            df[f"flightnum_od_depdelay_mean_last{w}"] = out_means[w]
+        df[f"flightnum_od_support_count_last{wmax}d"] = out_supp
+        df[f"flightnum_od_low_support_last{wmax}d"] = out_low
         return df
 
     d_dates = df_small["FlightDate"].to_numpy()
@@ -483,18 +501,38 @@ def add_recent_flightnum_od_mean_from_history(
         n_hist = len(h_dates_i)
         n_df_g = len(df_dates_i)
 
+        # Maintain:
+        # - lastN flights deque for "recent flight history" (not requested as feature but useful if you later want it)
+        # - window deques for each W in days: store (date_int, delay) for last W calendar days
         lastN = deque(maxlen=int(n_recent))
-        lastNd_dates = deque()
+        win_deques = {w: deque() for w in windows}
+        win_sums = {w: 0.0 for w in windows}
+        win_counts = {w: 0 for w in windows}
 
-        def _advance_window(current_date_int: int):
-            cutoff = current_date_int - int(n_days)
-            while lastNd_dates and lastNd_dates[0] < cutoff:
-                lastNd_dates.popleft()
+        def _evict(win: int, current_date_int: int):
+            cutoff = current_date_int - int(win)
+            dq = win_deques[win]
+            while dq and dq[0][0] < cutoff:
+                d0, v0 = dq.popleft()
+                win_sums[win] -= float(v0)
+                win_counts[win] -= 1
+
+        def _evict_all(current_date_int: int):
+            for w in windows:
+                _evict(w, current_date_int)
+
+        def _push_to_all(date_int: int, delayv: float):
+            for w in windows:
+                # store the observation at its FlightDate
+                win_deques[w].append((date_int, float(delayv)))
+                win_sums[w] += float(delayv)
+                win_counts[w] += 1
 
         while i_df < n_df_g:
             next_df_date = int(df_dates_i[i_df])
             next_df_t = int(df_t_i[i_df])
 
+            # add all HISTORY events strictly before this df row (date, then time)
             while i_hist < n_hist:
                 hd = int(h_dates_i[i_hist])
                 ht = int(h_t_i[i_hist])
@@ -502,45 +540,69 @@ def add_recent_flightnum_od_mean_from_history(
                     delayv = float(h_delay_i[i_hist])
                     if np.isfinite(delayv):
                         lastN.append(delayv)
-                    lastNd_dates.append(hd)
+                        _push_to_all(hd, delayv)
                     i_hist += 1
                 else:
                     break
 
-            _advance_window(next_df_date)
+            # evict old observations per window
+            _evict_all(next_df_date)
 
-            if len(lastN) > 0:
-                out_mean.loc[df_idx_i[i_df]] = float(np.mean(np.fromiter(lastN, dtype=np.float32)))
-            else:
-                out_mean.loc[df_idx_i[i_df]] = np.nan
+            # compute features for this df row (based on prior obs only)
+            for w in windows:
+                if win_counts[w] > 0:
+                    out_means[w].loc[df_idx_i[i_df]] = float(win_sums[w] / max(1, win_counts[w]))
+                else:
+                    out_means[w].loc[df_idx_i[i_df]] = np.nan
 
-            supp = int(len(lastNd_dates))
+            # support + low-support based on longest window
+            supp = int(win_counts[wmax])
             out_supp.loc[df_idx_i[i_df]] = np.int16(min(supp, np.iinfo(np.int16).max))
             out_low.loc[df_idx_i[i_df]] = np.int8(1 if supp <= int(low_support_leq) else 0)
 
+            # now add THIS row’s delay into the windows for future rows (still no leakage)
             dv = float(df_delay_i[i_df]) if np.isfinite(df_delay_i[i_df]) else np.nan
             if np.isfinite(dv):
                 lastN.append(dv)
-            lastNd_dates.append(next_df_date)
+                _push_to_all(next_df_date, dv)
 
             i_df += 1
 
-    df["flightnum_od_depdelay_mean_lastN"] = pd.to_numeric(out_mean, errors="coerce")
-    df["flightnum_od_support_count_lastNd"] = pd.to_numeric(out_supp, errors="coerce").fillna(0).astype("Int16")
-    df["flightnum_od_low_support"] = pd.to_numeric(out_low, errors="coerce").fillna(1).astype("Int8")
+    for w in windows:
+        df[f"flightnum_od_depdelay_mean_last{w}"] = pd.to_numeric(out_means[w], errors="coerce")
+
+    df[f"flightnum_od_support_count_last{wmax}d"] = pd.to_numeric(out_supp, errors="coerce").fillna(0).astype("Int16")
+    df[f"flightnum_od_low_support_last{wmax}d"] = pd.to_numeric(out_low, errors="coerce").fillna(1).astype("Int8")
     return df
 
 
-def add_carrier_dep_delay_baselines_from_history(df: pd.DataFrame, hist: pd.DataFrame, n_days: int = 14) -> pd.DataFrame:
+# ---------- NEW: carrier + carrier-origin rolling means over multiple windows ----------
+def add_carrier_dep_delay_baselines_from_history_multi(
+    df: pd.DataFrame,
+    hist: pd.DataFrame,
+    windows_days: List[int],
+) -> pd.DataFrame:
+    """
+    Adds:
+      carrier_depdelay_mean_last{W}
+      carrier_origin_depdelay_mean_last{W}
+    where W is in windows_days.
+
+    Uses daily carrier (and carrier-origin) mean dep delay, then rolling over W days, shifted by 1 day (no leakage).
+    """
     df = df.copy()
+    windows = sorted({int(w) for w in windows_days if int(w) > 0})
+    if not windows:
+        return df
+
     df["FlightDate"] = pd.to_datetime(df["FlightDate"], errors="coerce").dt.normalize()
     df["Reporting_Airline"] = df["Reporting_Airline"].astype(str).str.upper().str.strip()
     df["Origin"] = df["Origin"].astype(str).str.upper().str.strip()
 
     hist = hist.copy()
-    hist["FlightDate"] = pd.to_datetime(hist["FlightDate"], errors="coerce").dt.normalize()
-    hist["Reporting_Airline"] = hist["Reporting_Airline"].astype(str).str.upper().str.strip()
-    hist["Origin"] = hist["Origin"].astype(str).str.upper().str.strip()
+    hist["FlightDate"] = pd.to_datetime(hist.get("FlightDate"), errors="coerce").dt.normalize()
+    hist["Reporting_Airline"] = hist.get("Reporting_Airline", "").astype(str).str.upper().str.strip()
+    hist["Origin"] = hist.get("Origin", "").astype(str).str.upper().str.strip()
     hist["DepDelayMinutes"] = pd.to_numeric(hist.get("DepDelayMinutes"), errors="coerce")
 
     carr = hist.dropna(subset=["Reporting_Airline", "FlightDate", "DepDelayMinutes"]).copy()
@@ -549,17 +611,16 @@ def add_carrier_dep_delay_baselines_from_history(df: pd.DataFrame, hist: pd.Data
         .mean()
         .sort_values(["Reporting_Airline", "FlightDate"])
     )
-    carr_daily["carrier_depdelay_mean_lastNdays"] = (
-        carr_daily.groupby("Reporting_Airline")["DepDelayMinutes"]
-        .apply(lambda s: s.shift(1).rolling(window=int(n_days), min_periods=1).mean())
-        .reset_index(level=0, drop=True)
-    )
 
-    df = df.merge(
-        carr_daily[["Reporting_Airline", "FlightDate", "carrier_depdelay_mean_lastNdays"]],
-        on=["Reporting_Airline", "FlightDate"],
-        how="left",
-    )
+    for w in windows:
+        carr_daily[f"carrier_depdelay_mean_last{w}"] = (
+            carr_daily.groupby("Reporting_Airline")["DepDelayMinutes"]
+            .apply(lambda s: s.shift(1).rolling(window=int(w), min_periods=1).mean())
+            .reset_index(level=0, drop=True)
+        )
+
+    keep_cols = ["Reporting_Airline", "FlightDate"] + [f"carrier_depdelay_mean_last{w}" for w in windows]
+    df = df.merge(carr_daily[keep_cols], on=["Reporting_Airline", "FlightDate"], how="left")
 
     co = carr.dropna(subset=["Origin"]).copy()
     co_daily = (
@@ -567,17 +628,62 @@ def add_carrier_dep_delay_baselines_from_history(df: pd.DataFrame, hist: pd.Data
         .mean()
         .sort_values(["Reporting_Airline", "Origin", "FlightDate"])
     )
-    co_daily["carrier_origin_depdelay_mean_lastNdays"] = (
-        co_daily.groupby(["Reporting_Airline", "Origin"])["DepDelayMinutes"]
-        .apply(lambda s: s.shift(1).rolling(window=int(n_days), min_periods=1).mean())
-        .reset_index(level=[0, 1], drop=True)
+
+    for w in windows:
+        co_daily[f"carrier_origin_depdelay_mean_last{w}"] = (
+            co_daily.groupby(["Reporting_Airline", "Origin"])["DepDelayMinutes"]
+            .apply(lambda s: s.shift(1).rolling(window=int(w), min_periods=1).mean())
+            .reset_index(level=[0, 1], drop=True)
+        )
+
+    keep_cols = ["Reporting_Airline", "Origin", "FlightDate"] + [f"carrier_origin_depdelay_mean_last{w}" for w in windows]
+    df = df.merge(co_daily[keep_cols], on=["Reporting_Airline", "Origin", "FlightDate"], how="left")
+
+    return df
+
+
+# ---------- NEW: origin-airport rolling means over multiple windows ----------
+def add_origin_dep_delay_baselines_from_history_multi(
+    df: pd.DataFrame,
+    hist: pd.DataFrame,
+    windows_days: List[int],
+) -> pd.DataFrame:
+    """
+    Adds:
+      origin_depdelay_mean_last{W}
+    where W is in windows_days.
+
+    Uses daily origin mean dep delay (all carriers), rolling over W days, shifted by 1 day (no leakage).
+    """
+    df = df.copy()
+    windows = sorted({int(w) for w in windows_days if int(w) > 0})
+    if not windows:
+        return df
+
+    df["FlightDate"] = pd.to_datetime(df["FlightDate"], errors="coerce").dt.normalize()
+    df["Origin"] = df["Origin"].astype(str).str.upper().str.strip()
+
+    hist = hist.copy()
+    hist["FlightDate"] = pd.to_datetime(hist.get("FlightDate"), errors="coerce").dt.normalize()
+    hist["Origin"] = hist.get("Origin", "").astype(str).str.upper().str.strip()
+    hist["DepDelayMinutes"] = pd.to_numeric(hist.get("DepDelayMinutes"), errors="coerce")
+
+    o = hist.dropna(subset=["Origin", "FlightDate", "DepDelayMinutes"]).copy()
+    o_daily = (
+        o.groupby(["Origin", "FlightDate"], as_index=False)["DepDelayMinutes"]
+        .mean()
+        .sort_values(["Origin", "FlightDate"])
     )
 
-    df = df.merge(
-        co_daily[["Reporting_Airline", "Origin", "FlightDate", "carrier_origin_depdelay_mean_lastNdays"]],
-        on=["Reporting_Airline", "Origin", "FlightDate"],
-        how="left",
-    )
+    for w in windows:
+        o_daily[f"origin_depdelay_mean_last{w}"] = (
+            o_daily.groupby("Origin")["DepDelayMinutes"]
+            .apply(lambda s: s.shift(1).rolling(window=int(w), min_periods=1).mean())
+            .reset_index(level=0, drop=True)
+        )
+
+    keep_cols = ["Origin", "FlightDate"] + [f"origin_depdelay_mean_last{w}" for w in windows]
+    df = df.merge(o_daily[keep_cols], on=["Origin", "FlightDate"], how="left")
     return df
 
 
@@ -755,24 +861,25 @@ def main():
 
     df = add_weather_kelvin(df)
 
-    # congestion (from FULL history pool; no extra pool file)
     df = add_congestion_3h_features_from_history(df, hist)
-
     df = add_tail_and_flightnum_time_features(df)
 
+    windows_days = feat_cfg.get("rolling_windows_days") or [7, 14, 21, 28]
+    windows_days = [int(x) for x in windows_days]
+
     n_recent = int(feat_cfg.get("n_recent_flightnum_od", 20))
-    n_days_hist = int(feat_cfg.get("n_days_flightnum_od", 14))
     low_support_leq = int(feat_cfg.get("low_support_leq", 2))
 
-    df = add_recent_flightnum_od_mean_from_history(
-        df, hist,
+    df = add_flightnum_od_depdelay_means_from_history(
+        df,
+        hist,
+        windows_days=windows_days,
         n_recent=n_recent,
-        n_days=n_days_hist,
         low_support_leq=low_support_leq,
     )
 
-    n_days_carrier = int(feat_cfg.get("n_days_carrier_network", 14))
-    df = add_carrier_dep_delay_baselines_from_history(df, hist, n_days=n_days_carrier)
+    df = add_carrier_dep_delay_baselines_from_history_multi(df, hist, windows_days=windows_days)
+    df = add_origin_dep_delay_baselines_from_history_multi(df, hist, windows_days=windows_days)
 
     df = add_turn_time_hours(df)
 
