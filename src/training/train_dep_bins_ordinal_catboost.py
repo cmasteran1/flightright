@@ -5,8 +5,6 @@
 #
 # Run from REPO_ROOT (legacy):
 #   python src/training/train_dep_bins_ordinal_catboost.py \
-#       data/processed/features_dep_WN_50_23-25_unbalanced.parquet \
-#       data/models/dep_bins_WN \
 #       data/models/dep_bins_WN_config.json
 #
 # NEW (config-only):
@@ -528,6 +526,26 @@ def main():
                 plot_reliability(f"dep_ge{thr}_unbal_eval", y_eval, eval_proba, thr_dir, n_bins=REL_BINS)
             except Exception as e:
                 log(f"[plot][WARN] reliability (unbal eval) failed: {e}")
+
+        feature_names = cat_feats + num_feats
+
+        imp = clf.get_feature_importance(
+            Pool(X_train, y_train, cat_features=cat_idx),
+            type="LossFunctionChange"
+        )
+
+        imp_df = (
+            pd.DataFrame({
+                "feature": feature_names,
+                "importance": imp,
+            })
+            .sort_values("importance", ascending=False)
+        )
+
+        imp_path = thr_dir / "feature_importance_loss.csv"
+        imp_df.to_csv(imp_path, index=False)
+
+        log(f"[SAVE] feature importance -> {imp_path}")
 
         cat_model_path = thr_dir / f"catboost_dep_ge{thr}.cbm"
         clf.save_model(str(cat_model_path))
