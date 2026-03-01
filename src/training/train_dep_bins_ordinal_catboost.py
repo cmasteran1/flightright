@@ -3,6 +3,30 @@
 #
 # Ordinal/binned departure-delay probability model via calibrated P(delay >= thr).
 #
+# Pattern B (production-safe):
+#   - DO NOT joblib/pickle any custom Python classes.
+#   - Save a single deployable JOBLIB that is a plain dict:
+#       {
+#         "artifact_type": "dep_delay_bins_bundle_v1",
+#         "thresholds": [...],
+#         "bin_labels": [...],
+#         "bin_weights_minutes": [...],
+#         "severity_weights": [...],
+#         "categorical_features": [...],
+#         "numeric_features": [...],
+#         "feature_order": [...],
+#         "calibrators": {thr: CalibratedClassifierCV, ...},
+#         "registry": {thr: {"model_path": "...cbm", "cal_path": "...joblib"}, ...},
+#         "versions": {...},
+#         "created_utc": "...",
+#       }
+#
+# Runtime/inference code loads this dict and implements:
+#   - enforce_monotone_ge_probs
+#   - ge_to_bins
+#   - expected_delay = sum(P_bin * bin_weights_minutes)
+#   - severity_score = sum(P_bin * severity_weights)
+#
 # Run from REPO_ROOT (legacy):
 #   python src/training/train_dep_bins_ordinal_catboost.py \
 #       data/models/dep_bins_WN_config.json
@@ -12,8 +36,8 @@
 #
 import os, sys, json, time, signal, faulthandler
 from pathlib import Path
-from dataclasses import dataclass
-from typing import Dict, List, Optional, Any
+from typing import Dict, List, Any
+from datetime import datetime, timezone as dt_timezone
 
 import numpy as np
 import pandas as pd
@@ -275,81 +299,31 @@ def _resolve_run_args(argv):
     )
 
 
-# ------------------------------ deployable wrapper ------------------------------
-
-@dataclass
-class DepDelayBinsOrdinalModel:
-    """
-    Deployable artifact:
-      - holds calibrated per-threshold models for P(delay >= thr)
-      - converts them into 5-bin distribution
-      - provides "weighted" summaries:
-          1) expected delay minutes (weighted by representative minutes per bin)
-          2) severity score (weighted by severity levels 0..4)
-    """
-    thresholds: List[int]                   # e.g. [15, 30, 45, 60]
-    bin_labels: List[str]                   # 5 labels
-    calibrators: Dict[int, Any]             # thr -> fitted CalibratedClassifierCV
-    bin_weights_minutes: Optional[List[float]] = None  # length 5
-    severity_weights: Optional[List[float]] = None     # length 5
-
-    def predict_ge_proba(self, X) -> Dict[int, np.ndarray]:
-        out: Dict[int, np.ndarray] = {}
-        for thr in self.thresholds:
-            cal = self.calibrators[thr]
-            out[thr] = cal.predict_proba(X)[:, 1].astype(float)
-        return out
-
-    def predict_bin_proba(self, X) -> np.ndarray:
-        p_ge = self.predict_ge_proba(X)
-        t = self.thresholds
-        if len(t) != 4:
-            raise ValueError("This wrapper currently expects exactly 4 thresholds (e.g., 15/30/45/60).")
-        P = ge_to_bins(p_ge[t[0]], p_ge[t[1]], p_ge[t[2]], p_ge[t[3]])
-        return P.astype(float)
-
-    def predict_bin_label(self, X) -> List[str]:
-        P = self.predict_bin_proba(X)
-        idx = np.argmax(P, axis=1)
-        return [self.bin_labels[i] for i in idx]
-
-    def predict_expected_delay_minutes(self, X) -> np.ndarray:
-        """
-        Weighted expected delay minutes using representative values per bin.
-
-        Default weights are midpoints-ish:
-          <15 -> 7.5
-          15–30 -> 22.5
-          30–45 -> 37.5
-          45–60 -> 52.5
-          >=60 -> 75.0  (cap-ish; tweak if you want)
-        """
-        P = self.predict_bin_proba(X)
-        if self.bin_weights_minutes is None:
-            w = np.array([7.5, 22.5, 37.5, 52.5, 75.0], dtype=float)
-        else:
-            w = np.array(self.bin_weights_minutes, dtype=float)
-            if w.shape[0] != P.shape[1]:
-                raise ValueError("bin_weights_minutes must have length 5.")
-        return (P * w[None, :]).sum(axis=1)
-
-    def predict_severity_score(self, X) -> np.ndarray:
-        """
-        Weighted severity score (0..4) by default:
-          <15 -> 0
-          15–30 -> 1
-          30–45 -> 2
-          45–60 -> 3
-          >=60 -> 4
-        """
-        P = self.predict_bin_proba(X)
-        if self.severity_weights is None:
-            w = np.array([0.0, 1.0, 2.0, 3.0, 4.0], dtype=float)
-        else:
-            w = np.array(self.severity_weights, dtype=float)
-            if w.shape[0] != P.shape[1]:
-                raise ValueError("severity_weights must have length 5.")
-        return (P * w[None, :]).sum(axis=1)
+def _safe_versions() -> Dict[str, str]:
+    versions: Dict[str, str] = {}
+    try:
+        import sklearn
+        versions["sklearn"] = getattr(sklearn, "__version__", "unknown")
+    except Exception:
+        versions["sklearn"] = "unknown"
+    try:
+        import catboost
+        versions["catboost"] = getattr(catboost, "__version__", "unknown")
+    except Exception:
+        versions["catboost"] = "unknown"
+    try:
+        versions["numpy"] = getattr(np, "__version__", "unknown")
+    except Exception:
+        versions["numpy"] = "unknown"
+    try:
+        versions["pandas"] = getattr(pd, "__version__", "unknown")
+    except Exception:
+        versions["pandas"] = "unknown"
+    try:
+        versions["joblib"] = getattr(joblib, "__version__", "unknown")
+    except Exception:
+        versions["joblib"] = "unknown"
+    return versions
 
 
 # ------------------------------ main ------------------------------
@@ -405,10 +379,12 @@ def main():
         "max_rows": None,
         "prediction_samples_n": 500,
 
-        # New: weights for deployable outputs (optional)
+        # Weights for deployable outputs (optional)
         "bin_weights_minutes": [7.5, 22.5, 37.5, 52.5, 75.0],
         "severity_weights": [0.0, 1.0, 2.0, 3.0, 4.0],
-        "deploy_joblib_name": "dep_delay_bins_ordinal.joblib",
+
+        # Pattern B: save a PLAIN-DICT joblib (no custom classes)
+        "deploy_bundle_joblib_name": "dep_delay_bins_bundle.joblib",
     }
 
     if CFG_PATH is not None:
@@ -439,13 +415,15 @@ def main():
     dropped_missing = (len(cfg["categorical_features"]) - len(cat_feats)) + (len(cfg["numeric_features"]) - len(num_feats))
     log(f"[features] cats={len(cat_feats)} nums={len(num_feats)} dropped_missing={dropped_missing}", step=True)
 
+    feature_order = cat_feats + num_feats
+
     (OUTDIR / "resolved_features.json").write_text(
-        json.dumps({"categorical": cat_feats, "numeric": num_feats}, indent=2)
+        json.dumps({"categorical": cat_feats, "numeric": num_feats, "feature_order": feature_order}, indent=2)
     )
     log(f"[SAVE] resolved features -> {OUTDIR / 'resolved_features.json'}")
 
     def build_X(df: pd.DataFrame) -> pd.DataFrame:
-        X = df[cat_feats + num_feats].copy()
+        X = df[feature_order].copy()
         for c in cat_feats:
             X[c] = as_str(X[c])
         for c in num_feats:
@@ -502,7 +480,7 @@ def main():
     registry: Dict[int, Dict[str, str]] = {}
     cat_idx = [i for i, _c in enumerate(cat_feats)]
 
-    # New: keep calibrator objects in memory so we can write one deployable joblib
+    # Keep calibrators in-memory so we can export a single "bundle.joblib"
     calibrators_inmem: Dict[int, Any] = {}
 
     for thr in THRESHOLDS:
@@ -584,7 +562,6 @@ def main():
         calibrator.fit(X_cal, y_cal)
         log("[cal] done")
 
-        # Keep in-memory for deployable artifact
         calibrators_inmem[thr] = calibrator
 
         cal_proba = calibrator.predict_proba(X_cal)[:, 1]
@@ -620,7 +597,7 @@ def main():
             except Exception as e:
                 log(f"[plot][WARN] reliability (unbal eval) failed: {e}")
 
-        feature_names = cat_feats + num_feats
+        feature_names = feature_order
 
         imp = clf.get_feature_importance(
             Pool(X_train, y_train, cat_features=cat_idx),
@@ -637,12 +614,13 @@ def main():
 
         imp_path = thr_dir / "feature_importance_loss.csv"
         imp_df.to_csv(imp_path, index=False)
-
         log(f"[SAVE] feature importance -> {imp_path}")
 
+        # Save CatBoost model in native format (portable)
         cat_model_path = thr_dir / f"catboost_dep_ge{thr}.cbm"
         clf.save_model(str(cat_model_path))
 
+        # Save calibrator (sklearn)
         cal_path = thr_dir / f"calibrated_dep_ge{thr}.joblib"
         joblib.dump(calibrator, cal_path)
 
@@ -653,6 +631,7 @@ def main():
             "fpr_at_threshold": fpr,
             "categorical_features": cat_feats,
             "numeric_features": num_feats,
+            "feature_order": feature_order,
             "input_features_parquet": str(INPUT),
             "train_source": per_thr_paths.get(str(thr), str(INPUT)),
             "unbalanced_source": unbal_source,
@@ -684,11 +663,14 @@ def main():
 
     p_ge: Dict[int, np.ndarray] = {}
     for thr in THRESHOLDS:
-        # Use the in-memory calibrators (single source of truth)
         cal = calibrators_inmem[thr]
         p_ge[thr] = cal.predict_proba(X_eval)[:, 1].astype(float)
 
-    P = ge_to_bins(p_ge[15], p_ge[30], p_ge[45], p_ge[60])
+    # Convert to 5-bin distribution
+    if len(THRESHOLDS) != 4:
+        raise ValueError("This script currently expects exactly 4 thresholds (e.g., 15/30/45/60).")
+
+    P = ge_to_bins(p_ge[THRESHOLDS[0]], p_ge[THRESHOLDS[1]], p_ge[THRESHOLDS[2]], p_ge[THRESHOLDS[3]])
     pred_idx = np.argmax(P, axis=1)
     df_eval["pred_bin"] = pd.Series([bin_labels[i] for i in pred_idx], index=df_eval.index)
 
@@ -707,12 +689,12 @@ def main():
     df_eval["p_30_45"] = P[:, 2]
     df_eval["p_45_60"] = P[:, 3]
     df_eval["p_ge60"]  = P[:, 4]
-    df_eval["p_ge15"] = p_ge[15]
-    df_eval["p_ge30"] = p_ge[30]
-    df_eval["p_ge45"] = p_ge[45]
-    df_eval["p_ge60_raw"] = p_ge[60]
+    df_eval["p_ge15"] = p_ge[THRESHOLDS[0]]
+    df_eval["p_ge30"] = p_ge[THRESHOLDS[1]]
+    df_eval["p_ge45"] = p_ge[THRESHOLDS[2]]
+    df_eval["p_ge60_raw"] = p_ge[THRESHOLDS[3]]
 
-    # New: weighted summaries (minutes + severity) for the eval set
+    # Weighted summaries (minutes + severity)
     bin_weights_minutes = cfg.get("bin_weights_minutes", [7.5, 22.5, 37.5, 52.5, 75.0])
     severity_weights = cfg.get("severity_weights", [0.0, 1.0, 2.0, 3.0, 4.0])
 
@@ -752,35 +734,43 @@ def main():
         "unbalanced_cal_rows": int(len(df_cal_unbal)),
         "unbalanced_eval_rows": int(len(df_eval_unbal)),
         "unbalanced_cal_fraction": float(cal_frac),
-
-        # New: record weights used for weighted outputs
         "bin_weights_minutes": bin_weights_minutes,
         "severity_weights": severity_weights,
+        "feature_order": feature_order,
     }
     with open(OUTDIR / "bins_meta.json", "w") as f:
         json.dump(bins_meta, f, indent=2)
     log(f"[SAVE] bins meta -> {OUTDIR / 'bins_meta.json'}")
 
     # ------------------------------
-    # NEW: Save one deployable joblib that exposes:
-    #   - predict_bin_proba
-    #   - predict_expected_delay_minutes
-    #   - predict_severity_score
-    #   - predict_ge_proba
+    # Pattern B: Save ONE deployable bundle.joblib (plain dict, no custom classes)
     # ------------------------------
 
-    deploy_name = str(cfg.get("deploy_joblib_name", "dep_delay_bins_ordinal.joblib")).strip() or "dep_delay_bins_ordinal.joblib"
+    deploy_name = str(cfg.get("deploy_bundle_joblib_name", "dep_delay_bins_bundle.joblib")).strip() or "dep_delay_bins_bundle.joblib"
     deploy_path = OUTDIR / deploy_name
 
-    bins_model = DepDelayBinsOrdinalModel(
-        thresholds=THRESHOLDS,
-        bin_labels=bin_labels,
-        calibrators=calibrators_inmem,
-        bin_weights_minutes=list(bin_weights_minutes),
-        severity_weights=list(severity_weights),
-    )
-    joblib.dump(bins_model, deploy_path)
-    log(f"[SAVE] deployable bins model -> {deploy_path}")
+    bundle: Dict[str, Any] = {
+        "artifact_type": "dep_delay_bins_bundle_v1",
+        "created_utc": datetime.now(dt_timezone.utc).isoformat(),
+        "thresholds": THRESHOLDS,
+        "bin_labels": bin_labels,
+        "bin_weights_minutes": list(bin_weights_minutes),
+        "severity_weights": list(severity_weights),
+        "categorical_features": cat_feats,
+        "numeric_features": num_feats,
+        "feature_order": feature_order,
+        # NOTE: This is the key: we store calibrators directly, but as values in a dict,
+        # not wrapped in a custom class.
+        "calibrators": calibrators_inmem,
+        # Helpful paths for debugging / optional loading strategies
+        "registry": registry,
+        "versions": _safe_versions(),
+        # Keep the config used (useful for reproducibility)
+        "config_used": cfg,
+    }
+
+    joblib.dump(bundle, deploy_path)
+    log(f"[SAVE] deployable bundle -> {deploy_path}")
 
     log("[OK] finished training dep bin distribution models")
 
