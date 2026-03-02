@@ -11,7 +11,7 @@ As of right now, we make no attempt to access pertinent data the day of the flig
 This grabs the historical BTS flight data for the months selected by the user. The BTS registry is a public database which provides ample information about
 the history of commercial flights from registered US companies across all the U.S. Note that this will require a large amount of storage if more than a few months are
 grabbed. Next, the user must modify a config file to decide how to prune the data. Since it is impractical to train on all the data
-especially for multiple months, the user should filter by airline, airport, etc... other filters present in the sample config dep_arr_config.json. This pruning step also adds weather data
+especially for multiple months, the user should filter by airline, airport, etc... other filters are present in the sample config dep_arr_config.json. This pruning step also adds weather data
 obtained first from open-meteo free weather API and then cached locally for future use. The pruning step is run by: python src/fetch_prune/prepare_dataset.py path/to/config.json
 
     Now that we have pruned flights with attached weather, we can build specific features which might be viable for predicting our endpoint. As of now, we support building departure
@@ -26,6 +26,7 @@ and obtain expected congestion based on scheduled flights to and from origin and
 The basic output should also support showing certain raw features in digestible human-readable form. Forecast data, route history, and scheduled congestion
 are absolutely essential.
 
-Current Deployment model lives in runtime directory. Models can be tested using Command Line Interface (CLI). requires user to have valid credentials to aerodatabox API as well
-as opensky and nws credentials. Weather and flight schedules are pulled as needed. Data is converted into our feature list expectations. Running predictions have cost as API calls to
-aerodatabox are not free passed a given threshold.
+Currently, the deployment lives in flightright/src/flightright. Here, various features are pulled/computed mainly from flightlabs api endpoints. Weather forcast data can still
+be pulled from open-meteo. The main workhorse is flightright/cli/predict.py. This executable verifies that a flight exists, based on the future flights endpoint. Then tries to find the recent flight history based
+on the flight #. Then searches for daily and hourly forcast data. In the future, it will also search for airport and carrier history as soon as we can build up enough historical data to be meaningful.
+Based on the available data, a model is chosen. The chosen model is then optionally found through external storage on a VM and downloaded. This can now output prediction bins as well as various meaningful features.

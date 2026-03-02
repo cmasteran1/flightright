@@ -21,7 +21,6 @@ Remote model layout (in bucket):
   s3://<bucket>/<prefix>/<MODEL_DIR>/
     bins_meta.json
     dep_delay_bins_bundle.joblib        (preferred)
-    bep_delay_bins_bundle.joblib        (legacy typo support)
     prediction_samples.parquet
     registry.json
     resolved_features.json

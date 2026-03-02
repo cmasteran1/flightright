@@ -4,22 +4,24 @@ rolling_collector.py
 
 Long-running background process that:
 - tracks a fixed set of airports
-- runs a data pull at ~23:50 LOCAL TIME for each airport
-- writes daily JSON snapshots for later rolling-stat aggregation
+- runs data pulls multiple times per LOCAL day per airport
+- writes raw JSON snapshots
+- on the final run of the day, merges that day's snapshots into a deduped daily union
 
-Current behavior:
-- Uses FlightLabs "Flight Schedules API" endpoint:
+Endpoint:
+- FlightLabs Flight Schedules API:
     https://app.goflightlabs.com/advanced-flights-schedules
-  Example (docs):
-    https://app.goflightlabs.com/advanced-flights-schedules?access_key=...&iataCode=JFK&type=departure
-- Writes raw responses to disk
 
-Debugging upgrades:
-- on failures prints URL, status code, content-type
-- on JSON parse failure prints a short response-body preview
-- startup endpoint test (optional/ON by default) to verify the API works before entering the long loop
-- redacts access_key from printed URLs/errors
-- enforces endpoint limit <= 1000 (clamps and warns)
+Why multiple runs?
+- schedules APIs may not behave like a complete historical record
+- flights can appear/disappear over the day as provider updates/culls
+- multiple snapshots + daily union reduces the chance of missing flights
+
+Output layout:
+  output_dir/
+    AIRPORT/
+      snapshots/YYYY-MM-DD/HHMM.json
+      daily/YYYY-MM-DD.json
 """
 
 from __future__ import annotations
@@ -29,25 +31,39 @@ import csv
 import json
 import time
 import heapq
+import random
+import hashlib
 from dataclasses import dataclass
 from datetime import datetime, timedelta, date
 from pathlib import Path
 from typing import Dict, List, Any, Optional, Tuple
 
 import requests
+from requests import Response
+from requests.exceptions import RequestException, ReadTimeout, ConnectTimeout, Timeout
 from zoneinfo import ZoneInfo
 
 
 # ----------------------------- config -----------------------------
 
-DEFAULT_RUN_MINUTE = 50  # 23:50 local time
-DEFAULT_RUN_HOUR = 23
+DEFAULT_RUN_TIMES = ["08:00", "16:00", "23:50"]  # local times
+DEFAULT_FINAL_TIME = "23:50"                     # which local time triggers daily merge/finalize
 
-REQUEST_TIMEOUT = 30  # seconds
+# Use a tuple timeout: (connect_timeout, read_timeout)
+CONNECT_TIMEOUT_S = 10
+READ_TIMEOUT_S = 60
+REQUEST_TIMEOUT: Tuple[int, int] = (CONNECT_TIMEOUT_S, READ_TIMEOUT_S)
+
 UTC = ZoneInfo("UTC")
 
-FLIGHTLABS_SCHEDULES_URL = "https://app.goflightlabs.com/advanced-flights-schedules"
-FLIGHTLABS_MAX_LIMIT = 1000
+# Retry policy
+MAX_RETRIES = 5
+BACKOFF_BASE_S = 1.0
+BACKOFF_CAP_S = 30.0
+JITTER_S = 0.5
+
+# Small delay between calls to reduce burstiness
+INTER_CALL_SLEEP_S = 0.2
 
 
 # ----------------------------- helpers -----------------------------
@@ -62,10 +78,10 @@ def load_airports(path: Path) -> List[str]:
 
 def load_timezones(path: Path) -> Dict[str, str]:
     """
-    Reads your airport metadata CSV with header:
-      IATA,ICAO,AirportName,City,State,Country,Latitude,Longitude,Timezone
+    Reads airport metadata CSV with header containing at least:
+      IATA, Timezone
 
-    Returns: dict[IATA] = Timezone (IANA string, e.g. America/New_York)
+    Returns: dict[IATA] = Timezone (IANA string)
     """
     tz: Dict[str, str] = {}
     with path.open("r", encoding="utf-8", newline="") as f:
@@ -88,17 +104,23 @@ def load_timezones(path: Path) -> Dict[str, str]:
     return tz
 
 
-def next_run_utc(iata: str, tz_name: str, hour: int, minute: int) -> datetime:
+def parse_hhmm(s: str) -> Tuple[int, int]:
+    s = s.strip()
+    parts = s.split(":")
+    if len(parts) != 2:
+        raise ValueError(f"Invalid time '{s}', expected HH:MM")
+    hh = int(parts[0])
+    mm = int(parts[1])
+    if not (0 <= hh <= 23 and 0 <= mm <= 59):
+        raise ValueError(f"Invalid time '{s}', expected HH:MM 00-23:00-59")
+    return hh, mm
+
+
+def next_run_utc_for_time(tz_name: str, hour: int, minute: int) -> datetime:
     tz = ZoneInfo(tz_name)
     now_local = datetime.now(tz)
 
-    candidate = now_local.replace(
-        hour=hour,
-        minute=minute,
-        second=0,
-        microsecond=0,
-    )
-
+    candidate = now_local.replace(hour=hour, minute=minute, second=0, microsecond=0)
     if candidate <= now_local:
         candidate += timedelta(days=1)
 
@@ -106,38 +128,71 @@ def next_run_utc(iata: str, tz_name: str, hour: int, minute: int) -> datetime:
 
 
 def _preview(text: str, n: int = 300) -> str:
-    t = text.strip()
+    t = (text or "").strip()
     if len(t) <= n:
         return t
     return t[:n] + " ...[truncated]"
 
 
-def _redact_access_key_in_url(url: str) -> str:
-    """
-    Prevent leaking the API key in logs. Works for typical querystrings:
-      ...?access_key=XYZ&...
-    """
-    if "access_key=" not in url:
-        return url
-    # crude but reliable enough for logging
-    parts = url.split("access_key=")
-    prefix = parts[0] + "access_key="
-    rest = parts[1]
-    if "&" in rest:
-        _, tail = rest.split("&", 1)
-        return prefix + "[REDACTED]&" + tail
-    return prefix + "[REDACTED]"
+def _sleep_backoff(attempt: int) -> None:
+    delay = min(BACKOFF_BASE_S * (2 ** (attempt - 1)), BACKOFF_CAP_S)
+    delay += random.random() * JITTER_S
+    time.sleep(delay)
 
 
-def _clamp_limit(limit: Optional[int]) -> Optional[int]:
-    if limit is None:
-        return None
-    return min(int(limit), FLIGHTLABS_MAX_LIMIT)
+# ----------------------------- HTTP / FlightLabs -----------------------------
+
+def should_retry_http(status_code: int) -> bool:
+    return status_code == 429 or 500 <= status_code <= 599
 
 
-# ----------------------------- FlightLabs calls -----------------------------
+def request_with_retries(
+    session: requests.Session,
+    *,
+    method: str,
+    url: str,
+    params: Dict[str, Any],
+    timeout: Tuple[int, int],
+) -> Response:
+    for attempt in range(0, MAX_RETRIES + 1):
+        try:
+            r = session.request(method, url, params=params, timeout=timeout)
+            if should_retry_http(r.status_code):
+                body = _preview(r.text)
+                print(
+                    f"[WARN] HTTP {r.status_code} retryable for {r.url} "
+                    f"(attempt {attempt+1}/{MAX_RETRIES+1}) body_preview={body}"
+                )
+                if attempt < MAX_RETRIES:
+                    _sleep_backoff(attempt + 1)
+                    continue
+            return r
+
+        except (ReadTimeout, ConnectTimeout, Timeout) as e:
+            print(
+                f"[WARN] Timeout contacting {url} "
+                f"(attempt {attempt+1}/{MAX_RETRIES+1}): {e}"
+            )
+            if attempt < MAX_RETRIES:
+                _sleep_backoff(attempt + 1)
+                continue
+            raise
+
+        except RequestException as e:
+            print(
+                f"[WARN] RequestException contacting {url} "
+                f"(attempt {attempt+1}/{MAX_RETRIES+1}): {e}"
+            )
+            if attempt < MAX_RETRIES:
+                _sleep_backoff(attempt + 1)
+                continue
+            raise
+
+    raise RuntimeError("request_with_retries failed unexpectedly")
+
 
 def fetch_flight_schedules(
+    session: requests.Session,
     *,
     airport_iata: str,
     access_key: str,
@@ -147,45 +202,31 @@ def fetch_flight_schedules(
     limit: Optional[int],
     skip: Optional[int],
 ) -> dict:
-    """
-    Call FlightLabs Flight Schedules API.
+    url = "https://app.goflightlabs.com/advanced-flights-schedules"
 
-    Docs show:
-      https://app.goflightlabs.com/advanced-flights-schedules?access_key=...&iataCode=JFK&type=departure
-
-    Documented parameters include:
-      access_key (required), iataCode (required), type (optional; defaults to arrival),
-      airline_iata, flight_iata, limit, skip, etc.
-
-    NOTE: This endpoint enforces limit <= 1000 (observed from API error response).
-    """
     params: Dict[str, Any] = {
         "access_key": access_key,
         "iataCode": airport_iata,
         "type": flight_type,  # "departure" or "arrival"
     }
-
     if airline_iata:
         params["airline_iata"] = airline_iata.strip().upper()
     if flight_iata:
         params["flight_iata"] = flight_iata.strip().upper()
-
-    limit2 = _clamp_limit(limit)
-    if limit2 is not None:
-        params["limit"] = int(limit2)
+    if limit is not None:
+        params["limit"] = int(limit)
     if skip is not None:
         params["skip"] = int(skip)
 
-    r = requests.get(FLIGHTLABS_SCHEDULES_URL, params=params, timeout=REQUEST_TIMEOUT)
+    r = request_with_retries(session, method="GET", url=url, params=params, timeout=REQUEST_TIMEOUT)
     content_type = (r.headers.get("Content-Type") or "").lower()
-    safe_url = _redact_access_key_in_url(r.url)
 
     try:
         r.raise_for_status()
     except requests.HTTPError as e:
         body = _preview(r.text)
         raise RuntimeError(
-            f"HTTP {r.status_code} for {safe_url} | content-type={content_type} | body_preview={body}"
+            f"HTTP {r.status_code} for {r.url} | content-type={content_type} | body_preview={body}"
         ) from e
 
     try:
@@ -193,66 +234,103 @@ def fetch_flight_schedules(
     except ValueError as e:
         body = _preview(r.text)
         raise RuntimeError(
-            f"Non-JSON response for {safe_url} | HTTP {r.status_code} | content-type={content_type} | body_preview={body}"
+            f"Non-JSON response for {r.url} | HTTP {r.status_code} | content-type={content_type} | body_preview={body}"
         ) from e
 
 
-# ----------------------------- startup test -----------------------------
+# ----------------------------- dedupe / daily union -----------------------------
 
-def startup_test_endpoints(
-    *,
-    airports: List[str],
-    access_key: str,
-    flight_type: str,
-    airline_iata: Optional[str],
-    flight_iata: Optional[str],
-    limit: Optional[int],
-    skip: Optional[int],
-    sample_n: int,
-    per_airport_timeout_s: float,
-) -> None:
+def _get_nested(d: Any, path: List[str]) -> Optional[Any]:
+    cur = d
+    for p in path:
+        if not isinstance(cur, dict):
+            return None
+        cur = cur.get(p)
+    return cur
+
+
+def flight_dedupe_key(f: Any) -> str:
     """
-    Hit the endpoint immediately at startup so you know the credentials/params are valid
-    before the script goes into long sleeps.
+    Build a reasonably-stable dedupe key from common flight schema patterns.
 
-    - By default tests ALL airports (sample_n=0).
-    - Uses a small limit by default (you control via args) to reduce cost/time.
-    - Fails fast: first error stops the run with a clear message.
+    We try a few likely identifiers, falling back to a hash of the object if needed.
+    This is intentionally defensive because API field names can vary.
     """
-    if not airports:
-        raise ValueError("No airports provided; startup test cannot run.")
+    if not isinstance(f, dict):
+        return "obj:" + hashlib.sha256(json.dumps(f, sort_keys=True, default=str).encode()).hexdigest()
 
-    test_list = airports if sample_n <= 0 else airports[:sample_n]
+    # Common possibilities across flight APIs
+    candidates: List[Optional[str]] = []
 
-    print(f"[TEST] Startup endpoint test: {len(test_list)} airports (type={flight_type})")
-    print(f"[TEST] Using limit={limit}, skip={skip}, timeout={per_airport_timeout_s}s per airport")
+    # Flight identifiers
+    candidates.append(str(f.get("flight_iata") or f.get("flightIata") or f.get("flight") or "") or None)
+    candidates.append(str(_get_nested(f, ["flight", "iata"]) or _get_nested(f, ["flight", "iataNumber"]) or "") or None)
+    candidates.append(str(f.get("flight_number") or f.get("flightNumber") or "") or None)
 
-    # temporarily override global timeout for this phase (without changing REQUEST_TIMEOUT for main loop)
-    old_timeout = globals().get("REQUEST_TIMEOUT", 30)
-    globals()["REQUEST_TIMEOUT"] = int(max(1, per_airport_timeout_s))
+    # Airline
+    candidates.append(str(f.get("airline_iata") or f.get("airlineIata") or "") or None)
+    candidates.append(str(_get_nested(f, ["airline", "iata"]) or "") or None)
 
-    ok = 0
-    try:
-        for a in test_list:
-            try:
-                _ = fetch_flight_schedules(
-                    airport_iata=a,
-                    access_key=access_key,
-                    flight_type=flight_type,
-                    airline_iata=airline_iata,
-                    flight_iata=flight_iata,
-                    limit=limit,
-                    skip=skip,
-                )
-                ok += 1
-                print(f"[TEST-OK] {a}")
-            except Exception as e:
-                print(f"[TEST-FAIL] {a}: {e}")
-                raise SystemExit(2)
-    finally:
-        globals()["REQUEST_TIMEOUT"] = old_timeout
+    # Airports
+    candidates.append(str(_get_nested(f, ["departure", "iataCode"]) or _get_nested(f, ["departure", "iata"]) or "") or None)
+    candidates.append(str(_get_nested(f, ["arrival", "iataCode"]) or _get_nested(f, ["arrival", "iata"]) or "") or None)
 
-    print(f"[TEST] Startup endpoint test passed: {ok}/{len(test_list)} airports")
+    # Scheduled times (most important for distinguishing same flight number different days)
+    candidates.append(str(_get_nested(f, ["departure", "scheduled"]) or _get_nested(f, ["departure", "scheduledTime"]) or "") or None)
+    candidates.append(str(_get_nested(f, ["arrival", "scheduled"]) or _get_nested(f, ["arrival", "scheduledTime"]) or "") or None)
+
+    parts = [c.strip() for c in candidates if isinstance(c, str) and c.strip()]
+    if parts:
+        return "k:" + "|".join(parts)
+
+    # fallback: stable hash of the whole object
+    blob = json.dumps(f, sort_keys=True, default=str)
+    return "h:" + hashlib.sha256(blob.encode("utf-8")).hexdigest()
+
+
+def extract_flights(payload: Any) -> List[Any]:
+    """
+    The schedules endpoint typically returns a top-level list or a dict with a "data" list.
+    We defensively handle both.
+    """
+    if isinstance(payload, list):
+        return payload
+    if isinstance(payload, dict):
+        if isinstance(payload.get("data"), list):
+            return payload["data"]
+        if isinstance(payload.get("results"), list):
+            return payload["results"]
+    return []
+
+
+def merge_daily_snapshots(snapshot_files: List[Path]) -> Dict[str, Any]:
+    """
+    Merge a set of snapshot JSON files into a deduped union.
+    Returns a dict with merged flights and some metadata.
+    """
+    flights_by_key: Dict[str, Any] = {}
+    errors: List[str] = []
+
+    for fp in sorted(snapshot_files):
+        try:
+            raw = json.loads(fp.read_text(encoding="utf-8"))
+            data = raw.get("data", raw)
+            flights = extract_flights(data)
+            for f in flights:
+                k = flight_dedupe_key(f)
+                # Keep the "latest seen" version (overwrites older)
+                flights_by_key[k] = f
+        except Exception as e:
+            errors.append(f"{fp.name}: {e}")
+
+    merged = list(flights_by_key.values())
+    return {
+        "merged_flights": merged,
+        "unique_count": len(merged),
+        "snapshot_count": len(snapshot_files),
+        "snapshot_files": [p.name for p in sorted(snapshot_files)],
+        "merge_errors": errors,
+    }
 
 
 # ----------------------------- job scheduling -----------------------------
@@ -261,6 +339,8 @@ def startup_test_endpoints(
 class ScheduledJob:
     run_at_utc: datetime
     airport: str
+    hhmm: str
+    is_final: bool
 
 
 class Scheduler:
@@ -268,31 +348,32 @@ class Scheduler:
         self,
         airports: List[str],
         tz_map: Dict[str, str],
-        hour: int,
-        minute: int,
+        run_times: List[str],
+        final_time: str,
     ):
         self.tz_map = tz_map
-        self.hour = hour
-        self.minute = minute
+        self.run_times = run_times
+        self.final_time = final_time
         self.queue: List[ScheduledJob] = []
 
         for a in airports:
             if a not in tz_map:
                 raise ValueError(f"No timezone mapping for airport {a}")
-            run_at = next_run_utc(a, tz_map[a], hour, minute)
-            heapq.heappush(self.queue, ScheduledJob(run_at, a))
+            for hhmm in run_times:
+                hh, mm = parse_hhmm(hhmm)
+                run_at = next_run_utc_for_time(tz_map[a], hh, mm)
+                heapq.heappush(
+                    self.queue,
+                    ScheduledJob(run_at_utc=run_at, airport=a, hhmm=hhmm, is_final=(hhmm == final_time)),
+                )
 
     def next_job(self) -> ScheduledJob:
         return heapq.heappop(self.queue)
 
-    def reschedule(self, airport: str):
-        run_at = next_run_utc(
-            airport,
-            self.tz_map[airport],
-            self.hour,
-            self.minute,
-        )
-        heapq.heappush(self.queue, ScheduledJob(run_at, airport))
+    def reschedule(self, airport: str, hhmm: str, is_final: bool):
+        hh, mm = parse_hhmm(hhmm)
+        run_at = next_run_utc_for_time(self.tz_map[airport], hh, mm)
+        heapq.heappush(self.queue, ScheduledJob(run_at_utc=run_at, airport=airport, hhmm=hhmm, is_final=is_final))
 
 
 # ----------------------------- main loop -----------------------------
@@ -305,7 +386,7 @@ def main() -> int:
         required=True,
         help="airport metadata CSV containing IATA and Timezone columns",
     )
-    p.add_argument("--output-dir", required=True, help="where to write daily snapshots")
+    p.add_argument("--output-dir", required=True, help="where to write snapshots + daily unions")
     p.add_argument("--access-key", required=True, help="FlightLabs API key")
 
     # API filters
@@ -314,83 +395,53 @@ def main() -> int:
         dest="flight_type",
         default="departure",
         choices=["departure", "arrival"],
-        help='Flight type for schedules ("departure" or "arrival")',
     )
     p.add_argument("--airline-iata", default=None, help="Optional airline IATA filter (e.g. AA)")
     p.add_argument("--flight-iata", default=None, help="Optional flight IATA filter (e.g. AA171)")
-    p.add_argument("--limit", type=int, default=500, help="Max flights per call (endpoint enforces <= 1000)")
+    p.add_argument("--limit", type=int, default=500, help="Max flights per call (if supported)")
     p.add_argument("--skip", type=int, default=0, help="Records to skip for pagination (if supported)")
 
-    # startup tests
+    # schedule
     p.add_argument(
-        "--startup-test",
-        action="store_true",
-        default=True,
-        help="Run endpoint tests immediately on startup (default: ON).",
+        "--run-times",
+        default=",".join(DEFAULT_RUN_TIMES),
+        help='Comma-separated local times HH:MM, e.g. "08:00,16:00,23:50"',
     )
     p.add_argument(
-        "--no-startup-test",
-        dest="startup_test",
-        action="store_false",
-        help="Disable startup endpoint tests.",
-    )
-    p.add_argument(
-        "--startup-test-sample",
-        type=int,
-        default=0,
-        help="If >0, only test the first N airports at startup (0 = test all).",
-    )
-    p.add_argument(
-        "--startup-test-limit",
-        type=int,
-        default=1,
-        help="limit to use during startup tests (kept small to be fast/cheap).",
-    )
-    p.add_argument(
-        "--startup-test-timeout",
-        type=float,
-        default=10.0,
-        help="Per-airport timeout (seconds) during startup tests.",
+        "--final-time",
+        default=DEFAULT_FINAL_TIME,
+        help='Which HH:MM in --run-times counts as the final daily merge time (default "23:50")',
     )
 
-    # scheduling
-    p.add_argument("--hour", type=int, default=DEFAULT_RUN_HOUR)
-    p.add_argument("--minute", type=int, default=DEFAULT_RUN_MINUTE)
     args = p.parse_args()
+
+    run_times = [t.strip() for t in args.run_times.split(",") if t.strip()]
+    if not run_times:
+        raise ValueError("No run times specified")
+    for t in run_times:
+        parse_hhmm(t)  # validate
+    if args.final_time not in run_times:
+        raise ValueError(f"--final-time {args.final_time} must be one of --run-times: {run_times}")
 
     airports = load_airports(Path(args.airports))
     tz_map = load_timezones(Path(args.timezones))
 
-    # enforce limit <= 1000 (this prevents the exact error you saw)
-    if args.limit > FLIGHTLABS_MAX_LIMIT:
-        print(f"[WARN] --limit {args.limit} exceeds API max {FLIGHTLABS_MAX_LIMIT}; clamping to {FLIGHTLABS_MAX_LIMIT}")
-        args.limit = FLIGHTLABS_MAX_LIMIT
-
     out_root = Path(args.output_dir)
     out_root.mkdir(parents=True, exist_ok=True)
-
-    # Startup test before scheduler begins sleeping
-    if args.startup_test:
-        startup_test_endpoints(
-            airports=airports,
-            access_key=args.access_key,
-            flight_type=args.flight_type,
-            airline_iata=args.airline_iata,
-            flight_iata=args.flight_iata,
-            limit=min(args.startup_test_limit, FLIGHTLABS_MAX_LIMIT),
-            skip=0,
-            sample_n=args.startup_test_sample,
-            per_airport_timeout_s=args.startup_test_timeout,
-        )
 
     scheduler = Scheduler(
         airports=airports,
         tz_map=tz_map,
-        hour=args.hour,
-        minute=args.minute,
+        run_times=run_times,
+        final_time=args.final_time,
     )
 
+    # Session reuse (connection pooling)
+    session = requests.Session()
+    session.headers.update({"Accept": "application/json", "User-Agent": "rolling_collector/1.0"})
+
     print(f"[INFO] Tracking {len(airports)} airports")
+    print(f"[INFO] Run times (local): {run_times} | final={args.final_time}")
     print("[INFO] Collector started")
 
     while True:
@@ -404,12 +455,16 @@ def main() -> int:
         airport = job.airport
         tz = ZoneInfo(tz_map[airport])
         local_now = datetime.now(tz)
-        local_date: date = local_now.date()
+        local_date = local_now.date()
 
-        print(f"[RUN] {airport} local_date={local_date} type={args.flight_type}")
+        print(f"[RUN] {airport} local_date={local_date} hhmm={job.hhmm} type={args.flight_type} final={job.is_final}")
 
         try:
+            if INTER_CALL_SLEEP_S > 0:
+                time.sleep(INTER_CALL_SLEEP_S)
+
             data = fetch_flight_schedules(
+                session,
                 airport_iata=airport,
                 access_key=args.access_key,
                 flight_type=args.flight_type,
@@ -419,15 +474,18 @@ def main() -> int:
                 skip=args.skip,
             )
 
-            out_dir = out_root / airport
-            out_dir.mkdir(parents=True, exist_ok=True)
-            out_file = out_dir / f"{local_date.isoformat()}.json"
+            # Write snapshot
+            base = out_root / airport
+            snap_dir = base / "snapshots" / local_date.isoformat()
+            snap_dir.mkdir(parents=True, exist_ok=True)
+            snap_file = snap_dir / f"{job.hhmm.replace(':', '')}.json"
 
-            with out_file.open("w", encoding="utf-8") as f:
+            with snap_file.open("w", encoding="utf-8") as f:
                 json.dump(
                     {
                         "airport": airport,
                         "local_date": local_date.isoformat(),
+                        "hhmm_local": job.hhmm,
                         "fetched_at_utc": datetime.now(UTC).isoformat(),
                         "endpoint": "advanced-flights-schedules",
                         "request": {
@@ -443,12 +501,37 @@ def main() -> int:
                     indent=2,
                 )
 
-            print(f"[OK] wrote {out_file}")
+            print(f"[OK] wrote snapshot {snap_file}")
+
+            # On final run, merge that day's snapshots -> daily union
+            if job.is_final:
+                daily_dir = base / "daily"
+                daily_dir.mkdir(parents=True, exist_ok=True)
+                daily_file = daily_dir / f"{local_date.isoformat()}.json"
+
+                snapshot_files = sorted(snap_dir.glob("*.json"))
+                merged = merge_daily_snapshots(snapshot_files)
+
+                with daily_file.open("w", encoding="utf-8") as f:
+                    json.dump(
+                        {
+                            "airport": airport,
+                            "local_date": local_date.isoformat(),
+                            "finalized_at_utc": datetime.now(UTC).isoformat(),
+                            "source_snapshot_dir": str(snap_dir),
+                            **merged,
+                        },
+                        f,
+                        indent=2,
+                    )
+
+                print(f"[OK] wrote daily union {daily_file} (unique={merged['unique_count']} from {merged['snapshot_count']} snapshots)")
 
         except Exception as e:
             print(f"[ERROR] {airport}: {e}")
 
-        scheduler.reschedule(airport)
+        # Reschedule this same (airport, hhmm) job for the next day
+        scheduler.reschedule(airport, job.hhmm, job.is_final)
 
 
 if __name__ == "__main__":
