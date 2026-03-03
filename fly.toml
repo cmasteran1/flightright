@@ -3,11 +3,25 @@
 # See https://fly.io/docs/reference/configuration/ for information about how to use this file.
 #
 
-app = "flightright"
-primary_region = "iad"
+app = 'flightright'
+primary_region = 'iad'
+
+swap_size_mb = 512
 
 [processes]
-  app = "python -m uvicorn flightright.api.app:app --host 0.0.0.0 --port 8080"
+  app = "python -m uvicorn flightright.api.app:app --host 0.0.0.0 --port 8080 --workers 1"
+
+[http_service]
+  internal_port = 8080
+  force_https = true
+  auto_stop_machines = "off"
+  auto_start_machines = true
+  min_machines_running = 1
+  processes = ["app"]
+
+[mounts]
+  source = "flightright_data"
+  destination = "/data"
 
 [env]
   FLIGHTRIGHT_AIRPORTS_CSV = "/data/meta/airports.csv"
@@ -21,25 +35,9 @@ primary_region = "iad"
   FLIGHTRIGHT_AIRPORTS_N = "50"
   FLIGHTRIGHT_MODEL_YEARS = "23-25"
 
-[mounts]
-  source = "flightright_data"
-  destination = "/data"
-
-[http_service]
-  internal_port = 8080
-  force_https = true
-  auto_stop_machines = "off"
-  auto_start_machines = true
-  min_machines_running = 1
-  processes = ["app"]
-
-  [[http_service.checks]]
-    interval = "15s"
-    timeout = "5s"
-    grace_period = "4m"
-    method = "GET"
-    path = "/health"
-
 [[vm]]
-  memory = "2gb"
-  cpus = 1
+  # choose a bigger size from: fly platform vm-sizes
+  size = "performance-2x"
+  cpu_kind = "performance"
+  cpus = 2
+  memory = "8gb"
