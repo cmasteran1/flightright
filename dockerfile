@@ -5,6 +5,7 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
 
 WORKDIR /app
 
+ENV PYTHONPATH=/app/src
 # System deps (keep minimal; add build-essential only if you need it)
 RUN apt-get update && apt-get install -y --no-install-recommends \
     ca-certificates \
