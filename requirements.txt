@@ -120,6 +120,9 @@ websocket-client==1.8.0
 widgetsnbextension==4.0.14
 xgboost==2.1.4
 zipp==3.23.0
+fastapi==0.128.8
+uvicorn==0.39.0
+
 
 # ML libs used by training/inference
 catboost==1.2.5
