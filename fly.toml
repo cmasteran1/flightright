@@ -40,5 +40,3 @@ primary_region = 'iad'
 [processes]
   app = "sleep infinity"
 
-[env]
-  PYTHONPATH = "/app/src"
