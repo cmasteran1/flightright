@@ -18,7 +18,13 @@ from flightright.cli import predict as cli  # for warm() reuse
 
 app = FastAPI(title="flightright", version="0.1.0")
 
-
+@app.get("/")
+def root():
+    return {
+        "service": "flightright",
+        "status": "ok",
+        "version": "0.1.0"
+    }
 # -------------------------
 # Config from env
 # -------------------------
