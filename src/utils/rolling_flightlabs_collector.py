@@ -12,16 +12,15 @@ Endpoint:
 - FlightLabs Flight Schedules API:
     https://app.goflightlabs.com/advanced-flights-schedules
 
-Why multiple runs?
-- schedules APIs may not behave like a complete historical record
-- flights can appear/disappear over the day as provider updates/culls
-- multiple snapshots + daily union reduces the chance of missing flights
+Reliability upgrades:
+- requests.Session() connection pooling
+- separate (connect, read) timeouts
+- retry with exponential backoff + jitter for:
+    - timeouts / transient RequestException
+    - HTTP 429 and 5xx
 
-Output layout:
-  output_dir/
-    AIRPORT/
-      snapshots/YYYY-MM-DD/HHMM.json
-      daily/YYYY-MM-DD.json
+Security upgrade:
+- redact access_key from any logged URLs
 """
 
 from __future__ import annotations
@@ -37,6 +36,7 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta, date
 from pathlib import Path
 from typing import Dict, List, Any, Optional, Tuple
+from urllib.parse import urlsplit, urlunsplit, parse_qsl, urlencode
 
 import requests
 from requests import Response
@@ -67,6 +67,27 @@ INTER_CALL_SLEEP_S = 0.2
 
 
 # ----------------------------- helpers -----------------------------
+
+def redact_url(url: str, redact_keys: Tuple[str, ...] = ("access_key",)) -> str:
+    """
+    Return a version of the URL with sensitive query params redacted.
+    Example: access_key=... -> access_key=***
+    """
+    try:
+        parts = urlsplit(url)
+        q = parse_qsl(parts.query, keep_blank_values=True)
+        redacted = []
+        for k, v in q:
+            if k in redact_keys:
+                redacted.append((k, "***"))
+            else:
+                redacted.append((k, v))
+        new_query = urlencode(redacted, doseq=True)
+        return urlunsplit((parts.scheme, parts.netloc, parts.path, new_query, parts.fragment))
+    except Exception:
+        # If parsing fails, at least avoid leaking full URL
+        return "<redacted-url>"
+
 
 def load_airports(path: Path) -> List[str]:
     return [
@@ -157,10 +178,14 @@ def request_with_retries(
     for attempt in range(0, MAX_RETRIES + 1):
         try:
             r = session.request(method, url, params=params, timeout=timeout)
+
+            # Build redacted URL for logs (never log r.url raw)
+            safe_url = redact_url(r.url)
+
             if should_retry_http(r.status_code):
                 body = _preview(r.text)
                 print(
-                    f"[WARN] HTTP {r.status_code} retryable for {r.url} "
+                    f"[WARN] HTTP {r.status_code} retryable for {safe_url} "
                     f"(attempt {attempt+1}/{MAX_RETRIES+1}) body_preview={body}"
                 )
                 if attempt < MAX_RETRIES:
@@ -170,7 +195,7 @@ def request_with_retries(
 
         except (ReadTimeout, ConnectTimeout, Timeout) as e:
             print(
-                f"[WARN] Timeout contacting {url} "
+                f"[WARN] Timeout contacting {redact_url(url)} "
                 f"(attempt {attempt+1}/{MAX_RETRIES+1}): {e}"
             )
             if attempt < MAX_RETRIES:
@@ -180,7 +205,7 @@ def request_with_retries(
 
         except RequestException as e:
             print(
-                f"[WARN] RequestException contacting {url} "
+                f"[WARN] RequestException contacting {redact_url(url)} "
                 f"(attempt {attempt+1}/{MAX_RETRIES+1}): {e}"
             )
             if attempt < MAX_RETRIES:
@@ -220,13 +245,14 @@ def fetch_flight_schedules(
 
     r = request_with_retries(session, method="GET", url=url, params=params, timeout=REQUEST_TIMEOUT)
     content_type = (r.headers.get("Content-Type") or "").lower()
+    safe_url = redact_url(r.url)
 
     try:
         r.raise_for_status()
     except requests.HTTPError as e:
         body = _preview(r.text)
         raise RuntimeError(
-            f"HTTP {r.status_code} for {r.url} | content-type={content_type} | body_preview={body}"
+            f"HTTP {r.status_code} for {safe_url} | content-type={content_type} | body_preview={body}"
         ) from e
 
     try:
@@ -234,7 +260,7 @@ def fetch_flight_schedules(
     except ValueError as e:
         body = _preview(r.text)
         raise RuntimeError(
-            f"Non-JSON response for {r.url} | HTTP {r.status_code} | content-type={content_type} | body_preview={body}"
+            f"Non-JSON response for {safe_url} | HTTP {r.status_code} | content-type={content_type} | body_preview={body}"
         ) from e
 
 
@@ -250,32 +276,20 @@ def _get_nested(d: Any, path: List[str]) -> Optional[Any]:
 
 
 def flight_dedupe_key(f: Any) -> str:
-    """
-    Build a reasonably-stable dedupe key from common flight schema patterns.
-
-    We try a few likely identifiers, falling back to a hash of the object if needed.
-    This is intentionally defensive because API field names can vary.
-    """
     if not isinstance(f, dict):
         return "obj:" + hashlib.sha256(json.dumps(f, sort_keys=True, default=str).encode()).hexdigest()
 
-    # Common possibilities across flight APIs
     candidates: List[Optional[str]] = []
-
-    # Flight identifiers
     candidates.append(str(f.get("flight_iata") or f.get("flightIata") or f.get("flight") or "") or None)
     candidates.append(str(_get_nested(f, ["flight", "iata"]) or _get_nested(f, ["flight", "iataNumber"]) or "") or None)
     candidates.append(str(f.get("flight_number") or f.get("flightNumber") or "") or None)
 
-    # Airline
     candidates.append(str(f.get("airline_iata") or f.get("airlineIata") or "") or None)
     candidates.append(str(_get_nested(f, ["airline", "iata"]) or "") or None)
 
-    # Airports
     candidates.append(str(_get_nested(f, ["departure", "iataCode"]) or _get_nested(f, ["departure", "iata"]) or "") or None)
     candidates.append(str(_get_nested(f, ["arrival", "iataCode"]) or _get_nested(f, ["arrival", "iata"]) or "") or None)
 
-    # Scheduled times (most important for distinguishing same flight number different days)
     candidates.append(str(_get_nested(f, ["departure", "scheduled"]) or _get_nested(f, ["departure", "scheduledTime"]) or "") or None)
     candidates.append(str(_get_nested(f, ["arrival", "scheduled"]) or _get_nested(f, ["arrival", "scheduledTime"]) or "") or None)
 
@@ -283,16 +297,11 @@ def flight_dedupe_key(f: Any) -> str:
     if parts:
         return "k:" + "|".join(parts)
 
-    # fallback: stable hash of the whole object
     blob = json.dumps(f, sort_keys=True, default=str)
     return "h:" + hashlib.sha256(blob.encode("utf-8")).hexdigest()
 
 
 def extract_flights(payload: Any) -> List[Any]:
-    """
-    The schedules endpoint typically returns a top-level list or a dict with a "data" list.
-    We defensively handle both.
-    """
     if isinstance(payload, list):
         return payload
     if isinstance(payload, dict):
@@ -304,10 +313,6 @@ def extract_flights(payload: Any) -> List[Any]:
 
 
 def merge_daily_snapshots(snapshot_files: List[Path]) -> Dict[str, Any]:
-    """
-    Merge a set of snapshot JSON files into a deduped union.
-    Returns a dict with merged flights and some metadata.
-    """
     flights_by_key: Dict[str, Any] = {}
     errors: List[str] = []
 
@@ -318,7 +323,6 @@ def merge_daily_snapshots(snapshot_files: List[Path]) -> Dict[str, Any]:
             flights = extract_flights(data)
             for f in flights:
                 k = flight_dedupe_key(f)
-                # Keep the "latest seen" version (overwrites older)
                 flights_by_key[k] = f
         except Exception as e:
             errors.append(f"{fp.name}: {e}")
@@ -419,7 +423,7 @@ def main() -> int:
     if not run_times:
         raise ValueError("No run times specified")
     for t in run_times:
-        parse_hhmm(t)  # validate
+        parse_hhmm(t)
     if args.final_time not in run_times:
         raise ValueError(f"--final-time {args.final_time} must be one of --run-times: {run_times}")
 
@@ -436,7 +440,6 @@ def main() -> int:
         final_time=args.final_time,
     )
 
-    # Session reuse (connection pooling)
     session = requests.Session()
     session.headers.update({"Accept": "application/json", "User-Agent": "rolling_collector/1.0"})
 
@@ -474,7 +477,6 @@ def main() -> int:
                 skip=args.skip,
             )
 
-            # Write snapshot
             base = out_root / airport
             snap_dir = base / "snapshots" / local_date.isoformat()
             snap_dir.mkdir(parents=True, exist_ok=True)
@@ -503,7 +505,6 @@ def main() -> int:
 
             print(f"[OK] wrote snapshot {snap_file}")
 
-            # On final run, merge that day's snapshots -> daily union
             if job.is_final:
                 daily_dir = base / "daily"
                 daily_dir.mkdir(parents=True, exist_ok=True)
@@ -530,7 +531,6 @@ def main() -> int:
         except Exception as e:
             print(f"[ERROR] {airport}: {e}")
 
-        # Reschedule this same (airport, hhmm) job for the next day
         scheduler.reschedule(airport, job.hhmm, job.is_final)
 
 
