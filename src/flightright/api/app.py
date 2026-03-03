@@ -11,6 +11,7 @@ from typing import Any, Dict, Optional
 from fastapi import FastAPI, Header, HTTPException, Request
 from pydantic import BaseModel, Field
 
+from flightright.service.bootstrap_meta import ensure_meta_files
 from flightright.service.predictor import DataPaths, ModelSpecDefaults, RemoteModelConfig, ServiceConfig, predict_departure
 from flightright.cli import predict as cli  # for warm() reuse
 
@@ -124,6 +125,18 @@ class PredictIn(BaseModel):
 # -------------------------
 # Endpoints
 # -------------------------
+
+@app.on_event("startup")
+def _startup_bootstrap_meta() -> None:
+    bucket = os.environ.get("FLIGHTRIGHT_META_BUCKET") or os.environ.get("FLIGHTRIGHT_S3_BUCKET")
+    if not bucket:
+        raise RuntimeError("Missing FLIGHTRIGHT_META_BUCKET (or FLIGHTRIGHT_S3_BUCKET)")
+
+    downloads = [
+        ("meta/aircraft_registry_clean.csv", Path("/data/meta/aircraft_registry_clean.csv")),
+        ("meta/airport_rankings/50_group_4_total.txt", Path("/data/meta/airport_rankings/50_group_4_total.txt")),
+    ]
+    ensure_meta_files(bucket=bucket, downloads=downloads)
 @app.get("/health")
 def health() -> Dict[str, Any]:
     return {"ok": True}

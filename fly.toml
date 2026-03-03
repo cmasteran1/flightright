@@ -1,0 +1,39 @@
+# fly.toml app configuration file generated for flightright on 2026-03-03T09:54:25-05:00
+#
+# See https://fly.io/docs/reference/configuration/ for information about how to use this file.
+#
+
+app = 'flightright'
+primary_region = 'iad'
+
+[build]
+
+[http_service]
+  internal_port = 8080
+  force_https = true
+  auto_stop_machines = 'stop'
+  auto_start_machines = true
+  min_machines_running = 0
+  processes = ['app']
+
+[[vm]]
+  memory = '2gb'
+  cpus = 1
+  memory_mb = 2048
+
+[mounts]
+  source = "flightright_data"
+  destination = "/data"
+
+[env]
+  FLIGHTRIGHT_AIRPORTS_CSV = "/data/meta/airports.csv"
+  FLIGHTRIGHT_RANKINGS_DIR = "/data/meta/airport_rankings"
+  FLIGHTRIGHT_META_BUCKET = "flightright-models"
+  FLIGHTRIGHT_AIRCRAFT_REGISTRY_CSV = "/data/meta/aircraft_registry_clean.csv"
+  FLIGHTRIGHT_REMOTE_CACHE_DIR = "/data/remote_models_cache"
+  FLIGHTRIGHT_S3_BUCKET = "flightright-models"
+  FLIGHTRIGHT_S3_PREFIX = "models/"
+  FLIGHTRIGHT_S3_ENDPOINT = "https://s3.us-east-1.idrivee2.com"
+  FLIGHTRIGHT_AIRPORTS_N = "50"
+  FLIGHTRIGHT_MODEL_YEARS = "23-25"
+
