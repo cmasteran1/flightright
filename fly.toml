@@ -28,26 +28,17 @@ primary_region = "iad"
 [http_service]
   internal_port = 8080
   force_https = true
-
-  # Keep it always on (your current intent)
   auto_stop_machines = "off"
   auto_start_machines = true
   min_machines_running = 1
   processes = ["app"]
 
-  # Optional but nice: don’t let a burst of requests overwhelm a single VM
-  [http_service.concurrency]
-    type = "requests"
-    soft_limit = 50
-    hard_limit = 100
-
-  # Health check: FastAPI always serves this if the app is up
   [[http_service.checks]]
     interval = "15s"
-    timeout = "2s"
-    grace_period = "10s"
+    timeout = "5s"
+    grace_period = "4m"
     method = "GET"
-    path = "/openapi.json"
+    path = "/health"
 
 [[vm]]
   memory = "2gb"
