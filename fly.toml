@@ -37,3 +37,8 @@ primary_region = 'iad'
   FLIGHTRIGHT_AIRPORTS_N = "50"
   FLIGHTRIGHT_MODEL_YEARS = "23-25"
 
+[processes]
+  app = "sleep infinity"
+
+[env]
+  PYTHONPATH = "/app/src"
