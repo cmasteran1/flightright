@@ -1,0 +1,1100 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>flightright</title>
+    <style>
+      :root{
+        --bg0:#070915;
+        --bg1:#0b1022;
+        --card:rgba(255,255,255,.06);
+        --card2:rgba(255,255,255,.08);
+        --border:rgba(255,255,255,.12);
+        --muted:rgba(255,255,255,.65);
+        --text:rgba(255,255,255,.92);
+        --shadow: 0 20px 60px rgba(0,0,0,.45);
+        --radius: 22px;
+
+        --safe:#38d39f;
+        --caution:#f7c948;
+        --risk:#ff8a4c;
+        --high:#ff4d6d;
+        --accent:#7c5cff;
+      }
+
+      *{ box-sizing:border-box; }
+      html,body{ height:100%; }
+      body{
+        margin:0;
+        font-family: ui-sans-serif, system-ui, -apple-system, Segoe UI, Roboto, Helvetica, Arial, "Apple Color Emoji","Segoe UI Emoji";
+        color:var(--text);
+        background:
+          radial-gradient(900px 500px at 15% 0%, rgba(124,92,255,.35), transparent 60%),
+          radial-gradient(900px 500px at 95% 10%, rgba(56,211,159,.18), transparent 55%),
+          radial-gradient(700px 450px at 80% 80%, rgba(247,201,72,.10), transparent 55%),
+          linear-gradient(180deg, var(--bg0), var(--bg1));
+      }
+
+      .wrap{
+        max-width: 1240px;
+        margin: 28px auto 50px;
+        padding: 0 18px;
+      }
+
+      .topbar{
+        display:flex;
+        align-items:center;
+        justify-content:space-between;
+        gap:16px;
+        margin-bottom:18px;
+      }
+      .brand{
+        display:flex;
+        align-items:center;
+        gap:14px;
+      }
+      .logo{
+        width:44px;height:44px;border-radius:14px;
+        background: linear-gradient(135deg, rgba(124,92,255,1), rgba(56,211,159,.55));
+        box-shadow: 0 10px 30px rgba(124,92,255,.25);
+      }
+      .title h1{
+        font-size: 22px;
+        line-height: 1.1;
+        margin:0;
+        letter-spacing:.2px;
+      }
+      .title p{
+        margin:3px 0 0;
+        color:var(--muted);
+        font-size: 13.5px;
+      }
+
+      .status{
+        display:flex;
+        align-items:center;
+        gap:10px;
+        color:var(--muted);
+        font-size: 13px;
+      }
+      .pill{
+        display:inline-flex;
+        align-items:center;
+        gap:8px;
+        padding: 8px 12px;
+        border:1px solid var(--border);
+        border-radius: 999px;
+        background: rgba(255,255,255,.04);
+        box-shadow: inset 0 1px 0 rgba(255,255,255,.06);
+      }
+      .dot{
+        width:10px;height:10px;border-radius:50%;
+        background: rgba(255,255,255,.25);
+      }
+      .dot.ok{ background: var(--safe); }
+      .dot.bad{ background: var(--high); }
+      .dot.warn{ background: var(--caution); }
+
+      .grid{
+        display:grid;
+        grid-template-columns: 1.05fr 1.35fr;
+        gap:18px;
+        align-items:start;
+      }
+
+      .card{
+        background: var(--card);
+        border:1px solid var(--border);
+        border-radius: var(--radius);
+        box-shadow: var(--shadow);
+        overflow:hidden;
+        position:relative;
+      }
+
+      .card::before{
+        content:"";
+        position:absolute;
+        inset:-1px;
+        background: radial-gradient(700px 300px at 10% 0%, rgba(124,92,255,.16), transparent 60%),
+                    radial-gradient(700px 300px at 90% 0%, rgba(56,211,159,.10), transparent 55%);
+        pointer-events:none;
+        opacity:.8;
+      }
+
+      .card > *{ position:relative; }
+
+      .cardHeader{
+        display:flex;
+        justify-content:space-between;
+        align-items:center;
+        padding:18px 18px 12px;
+        border-bottom: 1px solid rgba(255,255,255,.06);
+      }
+      .cardHeader h2{
+        margin:0;
+        font-size:18px;
+        letter-spacing:.2px;
+      }
+      .subtle{
+        color:var(--muted);
+        font-size: 13px;
+      }
+
+      .panel{
+        padding: 16px 18px 18px;
+      }
+
+      .formGrid{
+        display:grid;
+        grid-template-columns: 1fr 1fr;
+        gap:14px;
+      }
+
+      label{
+        display:block;
+        font-size: 12.5px;
+        color: var(--muted);
+        margin-bottom: 6px;
+      }
+
+      input, select{
+        width:100%;
+        padding: 12px 12px;
+        border-radius: 14px;
+        border: 1px solid rgba(255,255,255,.12);
+        outline: none;
+        background: rgba(0,0,0,.18);
+        color: var(--text);
+        box-shadow: inset 0 1px 0 rgba(255,255,255,.06);
+      }
+
+      input:focus, select:focus{
+        border-color: rgba(124,92,255,.55);
+        box-shadow: 0 0 0 3px rgba(124,92,255,.18);
+      }
+
+      .btn{
+        margin-top: 14px;
+        width: 100%;
+        padding: 13px 14px;
+        border-radius: 16px;
+        border: none;
+        cursor: pointer;
+        color: white;
+        font-weight: 700;
+        letter-spacing:.2px;
+        background: linear-gradient(90deg, rgba(124,92,255,1), rgba(72,134,255,1));
+        box-shadow: 0 12px 34px rgba(124,92,255,.25);
+      }
+      .btn:disabled{
+        opacity:.6;
+        cursor:not-allowed;
+      }
+
+      .tip{
+        margin-top: 10px;
+        color: var(--muted);
+        font-size: 13px;
+      }
+
+      .tabs{
+        display:flex;
+        flex-wrap:wrap;
+        gap:10px;
+        padding: 12px 18px 0;
+      }
+
+      .tab{
+        border: 1px solid rgba(255,255,255,.12);
+        background: rgba(0,0,0,.16);
+        color: rgba(255,255,255,.78);
+        padding: 10px 14px;
+        border-radius: 999px;
+        cursor:pointer;
+        font-weight: 650;
+        font-size: 13.5px;
+        transition: all .15s ease;
+        user-select:none;
+      }
+      .tab:hover{ transform: translateY(-1px); }
+      .tab.active{
+        color: white;
+        border-color: rgba(124,92,255,.60);
+        background: rgba(124,92,255,.20);
+        box-shadow: inset 0 1px 0 rgba(255,255,255,.08);
+      }
+
+      .resultsTop{
+        display:flex;
+        justify-content:space-between;
+        align-items:center;
+        gap:14px;
+        padding: 14px 18px 0;
+      }
+      .route{
+        font-size: 13.5px;
+        color: var(--muted);
+      }
+
+      .content{
+        padding: 14px 18px 18px;
+        min-height: 420px;
+      }
+
+      .empty{
+        color: var(--muted);
+        font-size: 14px;
+        padding: 12px 2px;
+      }
+
+      .riskCard{
+        display:flex;
+        flex-wrap:wrap;
+        gap:12px;
+        align-items:stretch;
+        margin-bottom: 14px;
+      }
+      .riskBig{
+        flex: 1 1 280px;
+        padding: 16px;
+        border-radius: 18px;
+        border: 1px solid rgba(255,255,255,.12);
+        background: rgba(0,0,0,.18);
+      }
+      .riskBig h3{ margin:0 0 6px; font-size: 13px; color: var(--muted); font-weight:650; }
+      .riskScore{
+        font-size: 44px;
+        font-weight: 900;
+        letter-spacing: -.6px;
+        margin: 0;
+        line-height: 1.05;
+      }
+      .riskBand{
+        margin-top: 8px;
+        display:inline-flex;
+        align-items:center;
+        gap:8px;
+        padding: 8px 10px;
+        border-radius: 999px;
+        border: 1px solid rgba(255,255,255,.10);
+        font-weight: 750;
+        font-size: 13px;
+      }
+      .bandSafe{ background: rgba(56,211,159,.14); color: rgba(56,211,159,.95); border-color: rgba(56,211,159,.25); }
+      .bandCaution{ background: rgba(247,201,72,.14); color: rgba(247,201,72,.95); border-color: rgba(247,201,72,.28); }
+      .bandRisk{ background: rgba(255,138,76,.14); color: rgba(255,138,76,.95); border-color: rgba(255,138,76,.28); }
+      .bandHigh{ background: rgba(255,77,109,.14); color: rgba(255,77,109,.95); border-color: rgba(255,77,109,.28); }
+
+      .kpis{
+        flex: 1 1 340px;
+        display:grid;
+        grid-template-columns: 1fr 1fr;
+        gap:12px;
+      }
+      .kpi{
+        padding: 14px;
+        border-radius: 18px;
+        border: 1px solid rgba(255,255,255,.12);
+        background: rgba(0,0,0,.14);
+      }
+      .kpi .k{ color: var(--muted); font-size: 12.5px; margin-bottom: 6px; }
+      .kpi .v{ font-size: 18px; font-weight: 850; }
+
+      .barList{
+        display:flex;
+        flex-direction:column;
+        gap: 10px;
+        margin-top: 6px;
+      }
+      .barRow{
+        display:grid;
+        grid-template-columns: 110px 1fr 60px;
+        gap:10px;
+        align-items:center;
+      }
+      .barLabel{
+        color: var(--muted);
+        font-size: 12.5px;
+      }
+      .barTrack{
+        height: 12px;
+        border-radius: 999px;
+        border: 1px solid rgba(255,255,255,.10);
+        background: rgba(0,0,0,.16);
+        overflow:hidden;
+      }
+      .barFill{
+        height:100%;
+        border-radius: 999px;
+        background: linear-gradient(90deg, rgba(124,92,255,1), rgba(56,211,159,.9));
+        width: 0%;
+      }
+      .barVal{
+        text-align:right;
+        font-variant-numeric: tabular-nums;
+        color: rgba(255,255,255,.88);
+        font-size: 12.5px;
+        font-weight: 800;
+      }
+
+      .sectionTitle{
+        margin: 18px 0 10px;
+        font-size: 13px;
+        letter-spacing:.25px;
+        color: var(--muted);
+        font-weight: 800;
+        text-transform: uppercase;
+      }
+
+      .twoCol{
+        display:grid;
+        grid-template-columns: 1fr 1fr;
+        gap:12px;
+      }
+
+      .miniCard{
+        border:1px solid rgba(255,255,255,.10);
+        border-radius: 18px;
+        background: rgba(0,0,0,.14);
+        padding: 14px;
+      }
+      .miniCard h4{
+        margin:0 0 6px;
+        font-size: 13px;
+        color: rgba(255,255,255,.88);
+      }
+      .miniCard .small{
+        color: var(--muted);
+        font-size: 13px;
+        line-height: 1.35;
+      }
+
+      .wxRow{
+        display:flex;
+        gap:12px;
+        align-items:center;
+      }
+      .wxIcon{
+        width: 42px;
+        height: 42px;
+        border-radius: 14px;
+        border: 1px solid rgba(255,255,255,.12);
+        background: rgba(0,0,0,.16);
+        display:flex;
+        align-items:center;
+        justify-content:center;
+      }
+      .wxMeta .big{ font-weight: 900; font-size: 18px; margin:0; }
+      .wxMeta .muted{ margin:2px 0 0; color: var(--muted); font-size: 13px; }
+
+      .hist{
+        display:flex;
+        flex-direction:column;
+        gap:10px;
+      }
+
+      .footnote{
+        color: var(--muted);
+        font-size: 12.5px;
+        margin-top: 12px;
+      }
+
+      @media (max-width: 980px){
+        .grid{ grid-template-columns: 1fr; }
+        .content{ min-height: 360px; }
+      }
+    </style>
+  </head>
+
+  <body>
+    <div class="wrap">
+      <div class="topbar">
+        <div class="brand">
+          <div class="logo" aria-hidden="true"></div>
+          <div class="title">
+            <h1>flightright</h1>
+            <p>Understand delay risk before you head to the airport</p>
+          </div>
+        </div>
+
+        <div class="status">
+          <div class="pill" title="Checks the API health endpoint">
+            <span>API:</span>
+            <span id="apiLabel">checking…</span>
+            <span id="apiDot" class="dot warn" aria-hidden="true"></span>
+          </div>
+        </div>
+      </div>
+
+      <div class="grid">
+        <!-- LEFT: form -->
+        <div class="card">
+          <div class="cardHeader">
+            <h2>Check a flight</h2>
+            <div class="subtle">Day-ahead prediction</div>
+          </div>
+
+          <div class="panel">
+            <div class="formGrid">
+              <div>
+                <label for="airline">Airline (IATA)</label>
+                <input id="airline" maxlength="3" value="WN" />
+              </div>
+
+              <div>
+                <label for="flightnum">Flight number</label>
+                <input id="flightnum" inputmode="numeric" value="868" />
+              </div>
+
+              <div>
+                <label for="date">Date</label>
+                <input id="date" type="date" />
+              </div>
+
+              <div>
+                <label for="include">Include</label>
+                <select id="include">
+                  <option value="all" selected>All details</option>
+                  <option value="minimal">Prediction only</option>
+                </select>
+              </div>
+
+              <div>
+                <label for="origin">Origin</label>
+                <input id="origin" maxlength="3" value="BWI" />
+              </div>
+
+              <div>
+                <label for="dest">Destination</label>
+                <input id="dest" maxlength="3" value="CVG" />
+              </div>
+            </div>
+
+            <button id="goBtn" class="btn">Get delay risk</button>
+            <div class="tip">Tip: Try tomorrow’s date for the most stable results.</div>
+            <div id="formError" class="footnote" style="display:none;color:rgba(255,77,109,.95);font-weight:700;"></div>
+          </div>
+        </div>
+
+        <!-- RIGHT: results -->
+        <div class="card">
+          <div class="cardHeader">
+            <h2>Results</h2>
+            <div id="routeLabel" class="route">—</div>
+          </div>
+
+          <div class="tabs" role="tablist" aria-label="Results tabs">
+            <div class="tab active" data-tab="prediction" role="tab" aria-selected="true">Prediction</div>
+            <div class="tab" data-tab="weather" role="tab" aria-selected="false">Weather</div>
+            <div class="tab" data-tab="flight_history" role="tab" aria-selected="false">Flight # history</div>
+            <div class="tab" data-tab="airport" role="tab" aria-selected="false">Airport</div>
+            <div class="tab" data-tab="airline" role="tab" aria-selected="false">Airline</div>
+          </div>
+
+          <div id="content" class="content">
+            <div class="empty">Run a prediction to see results.</div>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <script>
+      // ---------- helpers ----------
+      function roundMinutes(x){
+        if (x === null || x === undefined) return null;
+        const n = Number(x);
+        if (!Number.isFinite(n)) return null;
+        return Math.round(n);
+      }
+
+      function roundProb(x){
+        if (x === null || x === undefined) return null;
+        const n = Number(x);
+        if (!Number.isFinite(n)) return null;
+        return Math.round(n * 1000) / 1000;
+      }
+
+      function clamp01(x){
+        const n = Number(x);
+        if (!Number.isFinite(n)) return 0;
+        return Math.max(0, Math.min(1, n));
+      }
+
+      function fmtPct(p){
+        const n = clamp01(p);
+        return (Math.round(n * 1000) / 10).toFixed(1) + "%";
+      }
+
+      function safeText(s){
+        return String(s ?? "").replace(/[&<>"']/g, (c) => ({
+          "&":"&amp;", "<":"&lt;", ">":"&gt;", '"':"&quot;", "'":"&#39;"
+        }[c]));
+      }
+
+      function todayISO(){
+        const d = new Date();
+        const tz = d.getTimezoneOffset() * 60000;
+        return new Date(d - tz).toISOString().slice(0,10);
+      }
+
+      function addDaysISO(n){
+        const d = new Date();
+        d.setDate(d.getDate() + n);
+        const tz = d.getTimezoneOffset() * 60000;
+        return new Date(d - tz).toISOString().slice(0,10);
+      }
+
+      // Weather “pictures” (inline SVG)
+      function wxIconSvg(kind){
+        // kind: "clear" | "cloud" | "rain" | "storm" | "snow" | "fog" | "unknown"
+        const base = `
+          <svg width="28" height="28" viewBox="0 0 24 24" fill="none" aria-hidden="true">
+        `;
+        const end = `</svg>`;
+        if (kind === "clear") {
+          return base + `
+            <circle cx="12" cy="12" r="4.5" stroke="rgba(255,255,255,.9)" stroke-width="1.6"/>
+            <path d="M12 1.8v3.2M12 19v3.2M1.8 12h3.2M19 12h3.2M4.2 4.2l2.3 2.3M17.5 17.5l2.3 2.3M19.8 4.2l-2.3 2.3M6.5 17.5l-2.3 2.3"
+              stroke="rgba(255,255,255,.75)" stroke-width="1.6" stroke-linecap="round"/>
+          ` + end;
+        }
+        if (kind === "cloud") {
+          return base + `
+            <path d="M7.5 18.2h9.2a3.6 3.6 0 0 0 .4-7.2A5.3 5.3 0 0 0 6.7 9.2a3.7 3.7 0 0 0 .8 9z"
+              stroke="rgba(255,255,255,.85)" stroke-width="1.6" stroke-linejoin="round"/>
+          ` + end;
+        }
+        if (kind === "rain") {
+          return base + `
+            <path d="M7.2 16.8h9.6a3.2 3.2 0 0 0 .3-6.4A4.9 4.9 0 0 0 7 9.1a3.4 3.4 0 0 0 .2 7.7z"
+              stroke="rgba(255,255,255,.85)" stroke-width="1.6" stroke-linejoin="round"/>
+            <path d="M9 19.2l-.9 2.2M12 19.2l-.9 2.2M15 19.2l-.9 2.2"
+              stroke="rgba(124,92,255,.95)" stroke-width="1.6" stroke-linecap="round"/>
+          ` + end;
+        }
+        if (kind === "storm") {
+          return base + `
+            <path d="M7.2 15.9h9.6a3.2 3.2 0 0 0 .3-6.4A4.9 4.9 0 0 0 7 8.2a3.4 3.4 0 0 0 .2 7.7z"
+              stroke="rgba(255,255,255,.85)" stroke-width="1.6" stroke-linejoin="round"/>
+            <path d="M12.2 16.2l-1.3 3h2.2l-1.4 3.2"
+              stroke="rgba(247,201,72,.95)" stroke-width="1.6" stroke-linejoin="round" stroke-linecap="round"/>
+          ` + end;
+        }
+        if (kind === "snow") {
+          return base + `
+            <path d="M7.2 16.8h9.6a3.2 3.2 0 0 0 .3-6.4A4.9 4.9 0 0 0 7 9.1a3.4 3.4 0 0 0 .2 7.7z"
+              stroke="rgba(255,255,255,.85)" stroke-width="1.6" stroke-linejoin="round"/>
+            <path d="M9.5 19.3h0M12 20.2h0M14.5 19.3h0"
+              stroke="rgba(56,211,159,.95)" stroke-width="4" stroke-linecap="round"/>
+          ` + end;
+        }
+        if (kind === "fog") {
+          return base + `
+            <path d="M6.2 12.2h11.6M5 15.2h14M7.4 18.2h9.2"
+              stroke="rgba(255,255,255,.75)" stroke-width="1.6" stroke-linecap="round"/>
+            <path d="M8 10.2h8"
+              stroke="rgba(255,255,255,.5)" stroke-width="1.6" stroke-linecap="round"/>
+          ` + end;
+        }
+        return base + `
+          <path d="M12 7v6" stroke="rgba(255,255,255,.75)" stroke-width="1.6" stroke-linecap="round"/>
+          <path d="M12 17.2h.01" stroke="rgba(255,255,255,.75)" stroke-width="4" stroke-linecap="round"/>
+        ` + end;
+      }
+
+      // Basic WMO-ish grouping (works even if your code isn’t exactly WMO; it’s a good visual fallback)
+      function wxKindFromCode(code){
+        const c = Number(code);
+        if (!Number.isFinite(c)) return "unknown";
+        if (c === 0) return "clear";
+        if ([1,2,3].includes(c)) return "cloud";
+        if ([45,48].includes(c)) return "fog";
+        if ((c >= 51 && c <= 67) || (c >= 80 && c <= 82)) return "rain";
+        if (c >= 71 && c <= 77) return "snow";
+        if (c >= 95) return "storm";
+        return "cloud";
+      }
+
+      function bandFromScore(score){
+        // score assumed 0..1-ish; fall back safely
+        const s = clamp01(score);
+        if (s < 0.25) return { name: "Safe", cls: "bandSafe" };
+        if (s < 0.50) return { name: "Caution", cls: "bandCaution" };
+        if (s < 0.75) return { name: "Risk", cls: "bandRisk" };
+        return { name: "High risk", cls: "bandHigh" };
+      }
+
+      function normalizeIata(x){
+        return String(x ?? "").trim().toUpperCase();
+      }
+
+      function normalizeFlightnum(x){
+        return String(x ?? "").trim();
+      }
+
+      // ---------- state ----------
+      const state = {
+        activeTab: "prediction",
+        lastInput: null,
+        lastResponse: null
+      };
+
+      // ---------- DOM ----------
+      const apiLabel = document.getElementById("apiLabel");
+      const apiDot = document.getElementById("apiDot");
+      const routeLabel = document.getElementById("routeLabel");
+      const content = document.getElementById("content");
+      const formError = document.getElementById("formError");
+
+      const airlineEl = document.getElementById("airline");
+      const flightnumEl = document.getElementById("flightnum");
+      const dateEl = document.getElementById("date");
+      const originEl = document.getElementById("origin");
+      const destEl = document.getElementById("dest");
+      const includeEl = document.getElementById("include");
+      const goBtn = document.getElementById("goBtn");
+
+      // default date = tomorrow
+      dateEl.value = addDaysISO(1);
+
+      // Tabs
+      document.querySelectorAll(".tab").forEach(tab => {
+        tab.addEventListener("click", () => {
+          document.querySelectorAll(".tab").forEach(t => {
+            t.classList.remove("active");
+            t.setAttribute("aria-selected", "false");
+          });
+          tab.classList.add("active");
+          tab.setAttribute("aria-selected", "true");
+          state.activeTab = tab.dataset.tab;
+          render();
+        });
+      });
+
+      // ---------- API status ----------
+      async function refreshApiStatus(){
+        apiLabel.textContent = "checking…";
+        apiDot.className = "dot warn";
+        try{
+          const r = await fetch("/api/health", { cache: "no-store" });
+          if (!r.ok) throw new Error("bad status " + r.status);
+          apiLabel.textContent = "online";
+          apiDot.className = "dot ok";
+        }catch(e){
+          apiLabel.textContent = "offline";
+          apiDot.className = "dot bad";
+        }
+      }
+      refreshApiStatus();
+      setInterval(refreshApiStatus, 15000);
+
+      // ---------- request ----------
+      function buildPayload(){
+        const airline = normalizeIata(airlineEl.value);
+        const flightnum = normalizeFlightnum(flightnumEl.value);
+        const date = dateEl.value;
+        const origin = normalizeIata(originEl.value);
+        const dest = normalizeIata(destEl.value);
+
+        if (!airline || airline.length < 2) return { error: "Airline code looks invalid." };
+        if (!flightnum) return { error: "Flight number is required." };
+        if (!date) return { error: "Date is required." };
+        if (!origin || origin.length !== 3) return { error: "Origin must be a 3-letter IATA code." };
+        if (!dest || dest.length !== 3) return { error: "Destination must be a 3-letter IATA code." };
+
+        const includeMode = includeEl.value;
+        const include = (includeMode === "minimal")
+          ? { } // nothing extra
+          : {
+              weather: true,
+              flight_history: true,
+              airport_stats: true,
+              airline_stats: true
+            };
+
+        return {
+          airline,
+          flightnum,
+          date,
+          origin,
+          dest,
+          include
+        };
+      }
+
+      async function runPredict(){
+        formError.style.display = "none";
+        const payload = buildPayload();
+        if (payload.error){
+          formError.textContent = payload.error;
+          formError.style.display = "block";
+          return;
+        }
+
+        state.lastInput = payload;
+        routeLabel.textContent = `${payload.origin}→${payload.dest} · ${payload.date}`;
+
+        goBtn.disabled = true;
+        goBtn.textContent = "Checking…";
+
+        try{
+          const r = await fetch("/api/predict", {
+            method: "POST",
+            headers: { "Content-Type":"application/json" },
+            body: JSON.stringify(payload)
+          });
+          const txt = await r.text();
+          let data = null;
+          try { data = JSON.parse(txt); } catch { /* ignore */ }
+
+          if (!r.ok){
+            const msg = (data && (data.detail || data.error)) ? (data.detail || data.error) : ("Request failed (" + r.status + ")");
+            throw new Error(msg);
+          }
+
+          state.lastResponse = data;
+          // Default to prediction tab on new result
+          state.activeTab = "prediction";
+          document.querySelectorAll(".tab").forEach(t => {
+            const on = (t.dataset.tab === "prediction");
+            t.classList.toggle("active", on);
+            t.setAttribute("aria-selected", on ? "true" : "false");
+          });
+
+          render();
+        }catch(e){
+          state.lastResponse = null;
+          content.innerHTML = `<div class="empty">Couldn’t run prediction: <b>${safeText(e.message)}</b></div>`;
+        }finally{
+          goBtn.disabled = false;
+          goBtn.textContent = "Get delay risk";
+        }
+      }
+
+      goBtn.addEventListener("click", runPredict);
+
+      // ---------- renderers ----------
+      function render(){
+        if (!state.lastResponse){
+          content.innerHTML = `<div class="empty">Run a prediction to see results.</div>`;
+          return;
+        }
+
+        const tab = state.activeTab;
+        if (tab === "prediction") renderPrediction(state.lastResponse);
+        else if (tab === "weather") renderWeather(state.lastResponse);
+        else if (tab === "flight_history") renderFlightHistory(state.lastResponse);
+        else if (tab === "airport") renderAirport(state.lastResponse);
+        else if (tab === "airline") renderAirline(state.lastResponse);
+        else content.innerHTML = `<div class="empty">Unknown tab.</div>`;
+      }
+
+      function renderPrediction(resp){
+        // Try a few shapes, since your API may evolve:
+        const p = resp.prediction || resp;
+
+        const severityScore = p.severity_score ?? p.severity ?? p.risk_score ?? null;
+        const band = bandFromScore(severityScore ?? 0);
+
+        const expected = roundMinutes(p.expected_delay_minutes ?? p.expected_delay ?? p.expected_minutes);
+        const predictedBin = p.predicted_bin ?? p.predicted_label ?? null;
+
+        const labels = p.bin_labels ?? p.labels ?? null;
+        const probs = p.bin_proba ?? p.bin_probs ?? p.probs ?? null;
+
+        const thresholds = p.thresholds ?? p.bins ?? null;
+
+        const scoreDisplay = (severityScore === null || severityScore === undefined)
+          ? "—"
+          : String(Math.round(clamp01(severityScore) * 100));
+
+        const expectedDisplay = (expected === null) ? "—" : `${expected} min`;
+        const binDisplay = predictedBin ? safeText(predictedBin) : "—";
+
+        content.innerHTML = `
+          <div class="riskCard">
+            <div class="riskBig">
+              <h3>Delay risk score</h3>
+              <div class="riskScore" style="color: ${
+                band.cls === "bandSafe" ? "rgba(56,211,159,.98)" :
+                band.cls === "bandCaution" ? "rgba(247,201,72,.98)" :
+                band.cls === "bandRisk" ? "rgba(255,138,76,.98)" :
+                "rgba(255,77,109,.98)"
+              }">${scoreDisplay}</div>
+              <div class="riskBand ${band.cls}">
+                ${safeText(band.name)}
+              </div>
+              <div class="footnote">Score is a normalized 0–100 indicator (higher = more risk).</div>
+            </div>
+
+            <div class="kpis">
+              <div class="kpi">
+                <div class="k">Expected delay</div>
+                <div class="v">${expectedDisplay}</div>
+              </div>
+              <div class="kpi">
+                <div class="k">Most likely bucket</div>
+                <div class="v">${binDisplay}</div>
+              </div>
+              <div class="kpi">
+                <div class="k">Bins</div>
+                <div class="v">${Array.isArray(labels) ? labels.length : (Array.isArray(probs) ? probs.length : "—")}</div>
+              </div>
+              <div class="kpi">
+                <div class="k">Thresholds (min)</div>
+                <div class="v">${Array.isArray(thresholds) ? thresholds.join(", ") : "—"}</div>
+              </div>
+            </div>
+          </div>
+
+          <div class="sectionTitle">Probability by delay bucket</div>
+          <div id="bars"></div>
+
+          <div class="sectionTitle">What this means</div>
+          <div class="twoCol">
+            <div class="miniCard">
+              <h4>Use it like a “risk meter”</h4>
+              <div class="small">
+                If the score is high, consider arriving a bit earlier, choosing a more flexible plan, or checking for earlier flights.
+              </div>
+            </div>
+            <div class="miniCard">
+              <h4>Why buckets?</h4>
+              <div class="small">
+                Buckets match what people care about: “on time-ish” vs. “meaningfully delayed”. The bars show how likely each outcome is.
+              </div>
+            </div>
+          </div>
+        `;
+
+        // Render bars
+        const bars = document.getElementById("bars");
+        const barList = document.createElement("div");
+        barList.className = "barList";
+
+        let L = Array.isArray(labels) ? labels : null;
+        let P = Array.isArray(probs) ? probs : null;
+
+        if (!L && P && Array.isArray(p.bin_labels_fallback)) L = p.bin_labels_fallback;
+
+        // If labels missing, generate from thresholds with standard framing
+        if (!L && Array.isArray(thresholds) && thresholds.length){
+          const t = thresholds.map(x => roundMinutes(x)).filter(x => Number.isFinite(x));
+          // This is just a best-effort label set
+          const tmp = [];
+          tmp.push(`< ${t[0]} min`);
+          for (let i=0;i<t.length-1;i++){
+            tmp.push(`${t[i]}–${t[i+1]} min`);
+          }
+          tmp.push(`≥ ${t[t.length-1]} min`);
+          L = tmp;
+        }
+
+        if (!P || !P.length){
+          bars.innerHTML = `<div class="empty">No bucket probabilities available for this response.</div>`;
+          return;
+        }
+
+        const n = P.length;
+        for (let i=0;i<n;i++){
+          const label = (L && L[i]) ? String(L[i]) : `Bucket ${i+1}`;
+          const pr = clamp01(P[i]);
+          const prRound = roundProb(pr);
+
+          const row = document.createElement("div");
+          row.className = "barRow";
+          row.innerHTML = `
+            <div class="barLabel">${safeText(label)}</div>
+            <div class="barTrack"><div class="barFill" style="width:${(pr*100).toFixed(2)}%"></div></div>
+            <div class="barVal">${(prRound ?? 0).toFixed(3)}</div>
+          `;
+          barList.appendChild(row);
+        }
+
+        bars.appendChild(barList);
+      }
+
+      function renderWeather(resp){
+  const w = resp?.tabs?.weather ?? null;
+  if (!w){
+    content.innerHTML = `<div class="empty">No weather included in this response. Try “Include → All details”.</div>`;
+    return;
+  }
+
+  const d = w.daily ?? {};
+  const h = w.hourly ?? {};
+
+  // Kelvin -> °F (friendly for US users). If you prefer °C, say so.
+  const KtoF = (K) => {
+    const n = Number(K);
+    if (!Number.isFinite(n)) return null;
+    return Math.round((n - 273.15) * 9/5 + 32);
+  };
+
+  const tMaxF = KtoF(d.origin_temp_max_K);
+  const tMinF = KtoF(d.origin_temp_min_K);
+
+  const precipMm = Number(d.origin_daily_precip_sum_mm);
+  const windKmhMax = Number(d.origin_daily_windspeed_max_kmh);
+
+  const depTempF = KtoF(h.origin_dep_temp_K);
+  const depPrecipMm = Number(h.origin_dep_precip_mm);
+  const depWindKmh = Number(h.origin_dep_windspeed_kmh);
+
+  const dailyCode = d.origin_daily_weathercode;
+  const hourlyCode = h.origin_dep_hour_weathercode;
+
+  const iconDaily = wxIconSvg(wxKindFromCode(dailyCode));
+  const iconHourly = wxIconSvg(wxKindFromCode(hourlyCode));
+
+  const tline = (tMinF != null && tMaxF != null) ? `${tMinF}°F – ${tMaxF}°F` : "—";
+  const windMaxLine = Number.isFinite(windKmhMax) ? `${Math.round(windKmhMax)} km/h` : "—";
+  const precipLine = Number.isFinite(precipMm) ? `${Math.round(precipMm * 10) / 10} mm` : "—";
+
+  const depTempLine = (depTempF != null) ? `${depTempF}°F` : "—";
+  const depWindLine = Number.isFinite(depWindKmh) ? `${Math.round(depWindKmh)} km/h` : "—";
+  const depPrecipLine = Number.isFinite(depPrecipMm) ? `${Math.round(depPrecipMm * 10) / 10} mm` : "—";
+
+  content.innerHTML = `
+    <div class="twoCol">
+      <div class="miniCard">
+        <div class="wxRow">
+          <div class="wxIcon">${iconDaily}</div>
+          <div class="wxMeta">
+            <p class="big">Daily outlook (origin)</p>
+            <p class="muted">Temp: ${safeText(tline)} · Code: ${safeText(dailyCode ?? "—")}</p>
+          </div>
+        </div>
+        <div class="footnote">Precip: ${safeText(precipLine)} · Max wind: ${safeText(windMaxLine)}</div>
+      </div>
+
+      <div class="miniCard">
+        <div class="wxRow">
+          <div class="wxIcon">${iconHourly}</div>
+          <div class="wxMeta">
+            <p class="big">At departure hour (origin)</p>
+            <p class="muted">Temp: ${safeText(depTempLine)} · Code: ${safeText(hourlyCode ?? "—")}</p>
+          </div>
+        </div>
+        <div class="footnote">Precip: ${safeText(depPrecipLine)} · Wind: ${safeText(depWindLine)}</div>
+      </div>
+    </div>
+
+    <div class="sectionTitle">How to read this</div>
+    <div class="miniCard">
+      <div class="small">
+        Icons summarize the weather codes. If you see rain/storm near departure, risk often increases.
+      </div>
+    </div>
+  `;
+}
+
+function renderFlightHistory(resp){
+  const fh = resp?.tabs?.flight_history ?? null;
+  if (!fh){
+    content.innerHTML = `<div class="empty">No flight-number history included. Try “Include → All details”.</div>`;
+    return;
+  }
+
+  const support28 = fh.flightnum_od_support_count_last28d;
+  const lowSupport28 = fh.flightnum_od_low_support_last28d;
+
+  const m7  = roundMinutes(fh.flightnum_od_depdelay_mean_last7);
+  const m14 = roundMinutes(fh.flightnum_od_depdelay_mean_last14);
+  const m21 = roundMinutes(fh.flightnum_od_depdelay_mean_last21);
+  const m28 = roundMinutes(fh.flightnum_od_depdelay_mean_last28);
+
+  // “Histogram-style”: show bars scaled to the max of these means (visual summary)
+  const vals = [m7, m14, m21, m28].map(v => (v == null ? 0 : v));
+  const maxv = Math.max(1, ...vals);
+
+  const rows = [
+    { label: "Last 7 days",  v: m7 },
+    { label: "Last 14 days", v: m14 },
+    { label: "Last 21 days", v: m21 },
+    { label: "Last 28 days", v: m28 }
+  ];
+
+  content.innerHTML = `
+    <div class="twoCol">
+      <div class="miniCard">
+        <h4>Recent delay history (this flight #, this route)</h4>
+        <div class="small">Average departure delay over rolling windows.</div>
+        <div class="footnote">
+          28-day sample size: <b>${safeText(support28 ?? "—")}</b>
+          ${lowSupport28 ? `· Low-support flag: <b>${safeText(lowSupport28)}</b>` : ""}
+        </div>
+      </div>
+
+      <div class="miniCard">
+        <h4>What to look for</h4>
+        <div class="small">
+          If the recent 7-day average is much higher than 28-day, it may indicate a temporary issue (ops, weather patterns, etc.).
+        </div>
+      </div>
+    </div>
+
+    <div class="sectionTitle">Histogram-style summary</div>
+    <div class="barList">
+      ${rows.map(r => {
+        const v = (r.v == null ? null : r.v);
+        const pct = v == null ? 0 : (v / maxv) * 100;
+        return `
+          <div class="barRow">
+            <div class="barLabel">${safeText(r.label)}</div>
+            <div class="barTrack"><div class="barFill" style="width:${pct.toFixed(2)}%"></div></div>
+            <div class="barVal">${v == null ? "—" : `${v}m`}</div>
+          </div>
+        `;
+      }).join("")}
+    </div>
+
+    <div class="footnote">Minutes are rounded to the nearest minute.</div>
+  `;
+}
+
+      function renderAirport(resp){
+  const a = resp?.tabs?.airport_stats ?? null;
+  if (!a){
+    content.innerHTML = `<div class="empty">No airport stats included. Try “Include → All details”.</div>`;
+    return;
+  }
+
+  content.innerHTML = `
+    <div class="miniCard">
+      <h4>Airport stats</h4>
+      <div class="small">
+        Origin airport: <b>${safeText(a.origin ?? "—")}</b>
+      </div>
+      <div class="footnote">
+        Your backend is currently returning only the airport code. Once you add metrics (delay rates, cancellations, etc.),
+        this tab will show them as cards (no JSON).
+      </div>
+    </div>
+  `;
+}
+
+function renderAirline(resp){
+  const a = resp?.tabs?.airline_stats ?? null;
+  if (!a){
+    content.innerHTML = `<div class="empty">No airline stats included. Try “Include → All details”.</div>`;
+    return;
+  }
+
+  content.innerHTML = `
+    <div class="miniCard">
+      <h4>Airline stats</h4>
+      <div class="small">
+        Airline: <b>${safeText(a.airline ?? "—")}</b>
+      </div>
+      <div class="footnote">
+        Your backend is currently returning only the airline code. Once you include metrics (del15 rate, avg delay, etc.),
+        we’ll render them as clean cards and charts.
+      </div>
+    </div>
+  `;
+}
+    </script>
+  </body>
+</html>
