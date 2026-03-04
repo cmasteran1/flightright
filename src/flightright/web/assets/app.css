@@ -1,0 +1,13 @@
+:root { font-family: ui-sans-serif, system-ui, -apple-system, Segoe UI, Roboto, Helvetica, Arial; }
+body { margin: 0; background: #0b1020; color: #e7e9ee; }
+.container { max-width: 860px; margin: 0 auto; padding: 28px 18px; }
+h1 { margin: 0 0 6px; }
+.muted { color: #aab1c2; }
+.card { background: #121a33; border: 1px solid #263055; border-radius: 14px; padding: 18px; margin-top: 18px; }
+.grid { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; margin: 12px 0; }
+label { display: flex; flex-direction: column; gap: 6px; font-size: 14px; color: #cdd3e2; }
+input { padding: 10px 10px; border-radius: 10px; border: 1px solid #2b3561; background: #0f1530; color: #e7e9ee; }
+button { padding: 10px 14px; border-radius: 10px; border: 1px solid #2b3561; background: #1a2755; color: #e7e9ee; cursor: pointer; }
+button:hover { background: #22326e; }
+.out { margin-top: 14px; background: #0a0f22; border: 1px solid #263055; border-radius: 12px; padding: 12px; overflow: auto; max-height: 420px; }
+@media (max-width: 720px) { .grid { grid-template-columns: 1fr; } }

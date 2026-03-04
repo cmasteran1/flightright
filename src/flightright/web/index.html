@@ -1,0 +1,55 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width,initial-scale=1" />
+    <title>FlightRight</title>
+    <link rel="stylesheet" href="/assets/app.css" />
+  </head>
+  <body>
+    <main class="container">
+      <h1>FlightRight</h1>
+      <p class="muted">Departure delay risk, day-ahead.</p>
+
+      <section class="card">
+        <h2>Predict</h2>
+
+        <div class="grid">
+          <label>Airline (IATA)
+            <input id="airline" value="WN" />
+          </label>
+
+          <label>Flight #
+            <input id="flightnum" value="868" />
+          </label>
+
+          <label>Date (YYYY-MM-DD)
+            <input id="date" value="2026-03-04" />
+          </label>
+
+          <label>Origin
+            <input id="origin" value="BWI" />
+          </label>
+
+          <label>Dest
+            <input id="dest" value="CVG" />
+          </label>
+
+          <label>API Key
+            <input id="apikey" type="password" placeholder="X-API-Key" />
+          </label>
+        </div>
+
+        <button id="btn">Predict</button>
+
+        <pre id="out" class="out"></pre>
+      </section>
+
+      <footer class="muted">
+        <span id="status">Checking service…</span>
+      </footer>
+    </main>
+
+    <script src="/assets/app.js"></script>
+  </body>
+</html>

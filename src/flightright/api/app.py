@@ -2,11 +2,11 @@
 from __future__ import annotations
 
 import os
+import shutil
 import time
 from dataclasses import dataclass
-from datetime import date
+from datetime import date, datetime, timezone
 from pathlib import Path
-from threading import BoundedSemaphore
 from typing import Any, Dict, Optional
 
 from fastapi import APIRouter, Depends, FastAPI, Header, HTTPException, Request
@@ -76,25 +76,6 @@ def _require_admin(x_admin_key: Optional[str]) -> None:
 
 
 # -------------------------
-# Concurrency limiting (prevents RAM spikes / OOM)
-# -------------------------
-# How many in-flight predictions to allow per machine.
-# Start conservative (1). If stable, try 2.
-_MAX_INFLIGHT = int(_env("FLIGHTRIGHT_MAX_INFLIGHT", "1") or "1")
-_PRED_SEM = BoundedSemaphore(value=max(1, _MAX_INFLIGHT))
-
-
-class _PredSlot:
-    def __enter__(self) -> None:
-        ok = _PRED_SEM.acquire(blocking=False)
-        if not ok:
-            raise HTTPException(status_code=503, detail="Server is busy. Please retry in a moment.")
-
-    def __exit__(self, exc_type, exc, tb) -> None:
-        _PRED_SEM.release()
-
-
-# -------------------------
 # Config from env
 # -------------------------
 def build_config() -> ServiceConfig:
@@ -102,6 +83,7 @@ def build_config() -> ServiceConfig:
     if not access_key:
         raise RuntimeError("Missing FLIGHTLABS_ACCESS_KEY")
 
+    # IMPORTANT for Fly volume: mount persistent storage at /data
     airports_csv = Path(_env("FLIGHTRIGHT_AIRPORTS_CSV", "/data/meta/airports.csv"))
     rankings_dir = Path(_env("FLIGHTRIGHT_RANKINGS_DIR", "/data/meta/airport_rankings"))
 
@@ -155,6 +137,7 @@ def _take_token(key: str) -> None:
         b = Bucket(tokens=BURST, last=now)
         RATE_STATE[key] = b
 
+    # refill
     dt = max(0.0, now - b.last)
     b.last = now
     b.tokens = min(BURST, b.tokens + (RATE_PER_MIN / 60.0) * dt)
@@ -201,24 +184,21 @@ class WarmIn(BaseModel):
 # -------------------------
 @app.on_event("startup")
 def _startup_bootstrap_meta() -> None:
-    try:
-        bucket = os.environ.get("FLIGHTRIGHT_META_BUCKET") or os.environ.get("FLIGHTRIGHT_S3_BUCKET")
-        if not bucket:
-            # Don't crash the app; just log.
-            print("WARN: Missing FLIGHTRIGHT_META_BUCKET (or FLIGHTRIGHT_S3_BUCKET); skipping meta bootstrap.")
-            return
+    bucket = os.environ.get("FLIGHTRIGHT_META_BUCKET") or os.environ.get("FLIGHTRIGHT_S3_BUCKET")
+    if not bucket:
+        raise RuntimeError("Missing FLIGHTRIGHT_META_BUCKET (or FLIGHTRIGHT_S3_BUCKET)")
 
-        downloads = [
-            ("meta/aircraft_registry_clean.csv", Path("/data/meta/aircraft_registry_clean.csv")),
-            ("meta/airport_rankings/50_group_4_total.txt", Path("/data/meta/airport_rankings/50_group_4_total.txt")),
-        ]
-        ensure_meta_files(bucket=bucket, downloads=downloads)
+    downloads = [
+        ("meta/aircraft_registry_clean.csv", Path("/data/meta/aircraft_registry_clean.csv")),
+        ("meta/airport_rankings/50_group_4_total.txt", Path("/data/meta/airport_rankings/50_group_4_total.txt")),
+    ]
+    ensure_meta_files(bucket=bucket, downloads=downloads)
 
-    except Exception as e:
-        # Never prevent startup due to meta download issues
-        print(f"WARN: meta bootstrap failed: {e!r}")
+
 # -------------------------
 # Routers
+#   - public: no auth
+#   - protected: require X-API-Key
 # -------------------------
 public = APIRouter()
 protected = APIRouter(dependencies=[Depends(require_api_key)])
@@ -238,30 +218,26 @@ def health() -> Dict[str, Any]:
 def predict(inp: PredictIn, request: Request) -> Dict[str, Any]:
     _take_token(_client_key(request))
 
-    with _PredSlot():
-        try:
-            return predict_departure(
-                airline=inp.airline,
-                flightnum=inp.flightnum,
-                dep_date=inp.date,
-                origin=inp.origin,
-                dest=inp.dest,
-                cfg=CFG,
-                include_weather=inp.include.weather,
-                include_flight_history=inp.include.flight_history,
-                include_airport_stats=inp.include.airport_stats,
-                include_airline_stats=inp.include.airline_stats,
-                include_features=False,   # never for public
-                public_mode=True,         # prevents model_locator leaks
-            )
-        except HTTPException:
-            raise
-        except Exception:
-            import logging
-
-            log = logging.getLogger("flightright")
-            log.exception("predict failed")
-            raise HTTPException(status_code=400, detail="Bad request.")
+    try:
+        return predict_departure(
+            airline=inp.airline,
+            flightnum=inp.flightnum,
+            dep_date=inp.date,
+            origin=inp.origin,
+            dest=inp.dest,
+            cfg=CFG,
+            include_weather=inp.include.weather,
+            include_flight_history=inp.include.flight_history,
+            include_airport_stats=inp.include.airport_stats,
+            include_airline_stats=inp.include.airline_stats,
+            include_features=False,   # never for public
+            public_mode=True,         # prevents model_locator leaks
+        )
+    except HTTPException:
+        raise
+    except Exception:
+        # Do not leak internals/paths; keep the error generic for public users
+        raise HTTPException(status_code=400, detail="Bad request.")
 
 
 @protected.post("/admin/predict")
@@ -271,26 +247,25 @@ def admin_predict(
     x_admin_key: Optional[str] = Header(default=None, alias="X-Admin-Key"),
 ) -> Dict[str, Any]:
     _require_admin(x_admin_key)
-    _take_token(_client_key(request))
+    _take_token(_client_key(request))  # still rate-limit admin by default
 
-    with _PredSlot():
-        try:
-            return predict_departure(
-                airline=inp.airline,
-                flightnum=inp.flightnum,
-                dep_date=inp.date,
-                origin=inp.origin,
-                dest=inp.dest,
-                cfg=CFG,
-                include_weather=inp.include.weather,
-                include_flight_history=inp.include.flight_history,
-                include_airport_stats=inp.include.airport_stats,
-                include_airline_stats=inp.include.airline_stats,
-                include_features=True,    # admin only
-                public_mode=False,        # include model_locator + remote_dir_prefix
-            )
-        except Exception as e:
-            raise HTTPException(status_code=400, detail=str(e))
+    try:
+        return predict_departure(
+            airline=inp.airline,
+            flightnum=inp.flightnum,
+            dep_date=inp.date,
+            origin=inp.origin,
+            dest=inp.dest,
+            cfg=CFG,
+            include_weather=inp.include.weather,
+            include_flight_history=inp.include.flight_history,
+            include_airport_stats=inp.include.airport_stats,
+            include_airline_stats=inp.include.airline_stats,
+            include_features=True,    # admin/debug includes raw features
+            public_mode=False,        # admin gets internal model_locator
+        )
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=str(e))
 
 
 @protected.post("/admin/warm")
@@ -317,6 +292,67 @@ def admin_warm(
     model_path = store.download_deploy_joblib(remote_dir_prefix)
 
     return {"ok": True, "remote_dir_prefix": remote_dir_prefix, "cached_model_path": str(model_path)}
+
+
+@protected.get("/admin/cache")
+def admin_cache(
+    x_admin_key: Optional[str] = Header(default=None, alias="X-Admin-Key"),
+) -> Dict[str, Any]:
+    """
+    Report what's on disk in the remote model cache.
+    Requires BOTH:
+      - X-API-Key (router dependency)
+      - X-Admin-Key (this handler)
+    """
+    _require_admin(x_admin_key)
+
+    cache_root = CFG.remote_models.remote_cache_dir or Path("/data/remote_models_cache")
+    cache_root = Path(cache_root)
+
+    files = []
+    total_bytes = 0
+
+    if cache_root.exists():
+        # look for common artifact types
+        patterns = ("*.joblib", "*.jl", "*.pkl", "*.pickle")
+        seen = set()
+        for pat in patterns:
+            for p in cache_root.rglob(pat):
+                if not p.is_file():
+                    continue
+                # de-dupe in case patterns overlap
+                rp = str(p.resolve())
+                if rp in seen:
+                    continue
+                seen.add(rp)
+
+                st = p.stat()
+                total_bytes += st.st_size
+                files.append(
+                    {
+                        "path": str(p.relative_to(cache_root)),
+                        "bytes": int(st.st_size),
+                        "modified_utc": datetime.fromtimestamp(st.st_mtime, tz=timezone.utc).isoformat(),
+                    }
+                )
+
+    files.sort(key=lambda x: x["bytes"], reverse=True)
+
+    # Disk usage (best effort)
+    try:
+        du = shutil.disk_usage("/data")
+        disk = {"path": "/data", "total_bytes": int(du.total), "used_bytes": int(du.used), "free_bytes": int(du.free)}
+    except Exception:
+        disk = {"path": "/data", "total_bytes": None, "used_bytes": None, "free_bytes": None}
+
+    return {
+        "ok": True,
+        "cache_root": str(cache_root),
+        "file_count": len(files),
+        "total_cached_bytes": int(total_bytes),
+        "disk": disk,
+        "files": files,
+    }
 
 
 app.include_router(public)
