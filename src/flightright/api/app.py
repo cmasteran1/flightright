@@ -6,6 +6,7 @@ import time
 from dataclasses import dataclass
 from datetime import date
 from pathlib import Path
+from threading import BoundedSemaphore
 from typing import Any, Dict, Optional
 
 from fastapi import APIRouter, Depends, FastAPI, Header, HTTPException, Request
@@ -52,6 +53,7 @@ def _env(key: str, default: Optional[str] = None) -> Optional[str]:
 # -------------------------
 _api_key_header = APIKeyHeader(name="X-API-Key", auto_error=False)
 
+
 def require_api_key(x_api_key: Optional[str] = Depends(_api_key_header)) -> None:
     """
     Require X-API-Key for protected endpoints.
@@ -74,6 +76,25 @@ def _require_admin(x_admin_key: Optional[str]) -> None:
 
 
 # -------------------------
+# Concurrency limiting (prevents RAM spikes / OOM)
+# -------------------------
+# How many in-flight predictions to allow per machine.
+# Start conservative (1). If stable, try 2.
+_MAX_INFLIGHT = int(_env("FLIGHTRIGHT_MAX_INFLIGHT", "1") or "1")
+_PRED_SEM = BoundedSemaphore(value=max(1, _MAX_INFLIGHT))
+
+
+class _PredSlot:
+    def __enter__(self) -> None:
+        ok = _PRED_SEM.acquire(blocking=False)
+        if not ok:
+            raise HTTPException(status_code=503, detail="Server is busy. Please retry in a moment.")
+
+    def __exit__(self, exc_type, exc, tb) -> None:
+        _PRED_SEM.release()
+
+
+# -------------------------
 # Config from env
 # -------------------------
 def build_config() -> ServiceConfig:
@@ -81,7 +102,6 @@ def build_config() -> ServiceConfig:
     if not access_key:
         raise RuntimeError("Missing FLIGHTLABS_ACCESS_KEY")
 
-    # IMPORTANT for Fly volume: mount persistent storage at /data
     airports_csv = Path(_env("FLIGHTRIGHT_AIRPORTS_CSV", "/data/meta/airports.csv"))
     rankings_dir = Path(_env("FLIGHTRIGHT_RANKINGS_DIR", "/data/meta/airport_rankings"))
 
@@ -135,7 +155,6 @@ def _take_token(key: str) -> None:
         b = Bucket(tokens=BURST, last=now)
         RATE_STATE[key] = b
 
-    # refill
     dt = max(0.0, now - b.last)
     b.last = now
     b.tokens = min(BURST, b.tokens + (RATE_PER_MIN / 60.0) * dt)
@@ -146,7 +165,6 @@ def _take_token(key: str) -> None:
 
 
 def _client_key(req: Request) -> str:
-    # v0: per-IP limiting. Add session cookies later if you want.
     host = req.client.host if req.client else "unknown"
     return f"ip:{host}"
 
@@ -196,43 +214,50 @@ def _startup_bootstrap_meta() -> None:
 
 # -------------------------
 # Routers
-#   - public: no auth
-#   - protected: require X-API-Key
 # -------------------------
 public = APIRouter()
 protected = APIRouter(dependencies=[Depends(require_api_key)])
+
 
 @public.get("/")
 def root() -> Dict[str, Any]:
     return {"service": "flightright", "status": "ok", "version": "0.1.0"}
 
+
 @public.get("/health")
 def health() -> Dict[str, Any]:
     return {"ok": True}
+
 
 @protected.post("/predict")
 def predict(inp: PredictIn, request: Request) -> Dict[str, Any]:
     _take_token(_client_key(request))
 
-    try:
-        return predict_departure(
-            airline=inp.airline,
-            flightnum=inp.flightnum,
-            dep_date=inp.date,
-            origin=inp.origin,
-            dest=inp.dest,
-            cfg=CFG,
-            include_weather=inp.include.weather,
-            include_flight_history=inp.include.flight_history,
-            include_airport_stats=inp.include.airport_stats,
-            include_airline_stats=inp.include.airline_stats,
-            include_features=False,
-            public_mode=True,
-        )
-    except HTTPException:
-        raise
-    except Exception as e:
-        raise HTTPException(status_code=400, detail=str(e))
+    with _PredSlot():
+        try:
+            return predict_departure(
+                airline=inp.airline,
+                flightnum=inp.flightnum,
+                dep_date=inp.date,
+                origin=inp.origin,
+                dest=inp.dest,
+                cfg=CFG,
+                include_weather=inp.include.weather,
+                include_flight_history=inp.include.flight_history,
+                include_airport_stats=inp.include.airport_stats,
+                include_airline_stats=inp.include.airline_stats,
+                include_features=False,   # never for public
+                public_mode=True,         # prevents model_locator leaks
+            )
+        except HTTPException:
+            raise
+        import logging
+        log = logging.getLogger("flightright")
+
+        except Exception:
+        log.exception("predict failed")
+        raise HTTPException(status_code=400, detail="Bad request.")
+
 
 @protected.post("/admin/predict")
 def admin_predict(
@@ -241,25 +266,27 @@ def admin_predict(
     x_admin_key: Optional[str] = Header(default=None, alias="X-Admin-Key"),
 ) -> Dict[str, Any]:
     _require_admin(x_admin_key)
-    _take_token(_client_key(request))  # still rate-limit admin by default
+    _take_token(_client_key(request))
 
-    try:
-        return predict_departure(
-            airline=inp.airline,
-            flightnum=inp.flightnum,
-            dep_date=inp.date,
-            origin=inp.origin,
-            dest=inp.dest,
-            cfg=CFG,
-            include_weather=inp.include.weather,
-            include_flight_history=inp.include.flight_history,
-            include_airport_stats=inp.include.airport_stats,
-            include_airline_stats=inp.include.airline_stats,
-            include_features=True,  # admin/debug includes raw features
-            public_mode=False,
-        )
-    except Exception as e:
-        raise HTTPException(status_code=400, detail=str(e))
+    with _PredSlot():
+        try:
+            return predict_departure(
+                airline=inp.airline,
+                flightnum=inp.flightnum,
+                dep_date=inp.date,
+                origin=inp.origin,
+                dest=inp.dest,
+                cfg=CFG,
+                include_weather=inp.include.weather,
+                include_flight_history=inp.include.flight_history,
+                include_airport_stats=inp.include.airport_stats,
+                include_airline_stats=inp.include.airline_stats,
+                include_features=True,    # admin only
+                public_mode=False,        # include model_locator + remote_dir_prefix
+            )
+        except Exception as e:
+            raise HTTPException(status_code=400, detail=str(e))
+
 
 @protected.post("/admin/warm")
 def admin_warm(
