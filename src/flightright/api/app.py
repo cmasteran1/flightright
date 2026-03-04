@@ -256,12 +256,12 @@ def predict(inp: PredictIn, request: Request) -> Dict[str, Any]:
             )
         except HTTPException:
             raise
-        import logging
-        log = logging.getLogger("flightright")
-
         except Exception:
-        log.exception("predict failed")
-        raise HTTPException(status_code=400, detail="Bad request.")
+            import logging
+
+            log = logging.getLogger("flightright")
+            log.exception("predict failed")
+            raise HTTPException(status_code=400, detail="Bad request.")
 
 
 @protected.post("/admin/predict")
