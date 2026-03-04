@@ -201,17 +201,22 @@ class WarmIn(BaseModel):
 # -------------------------
 @app.on_event("startup")
 def _startup_bootstrap_meta() -> None:
-    bucket = os.environ.get("FLIGHTRIGHT_META_BUCKET") or os.environ.get("FLIGHTRIGHT_S3_BUCKET")
-    if not bucket:
-        raise RuntimeError("Missing FLIGHTRIGHT_META_BUCKET (or FLIGHTRIGHT_S3_BUCKET)")
+    try:
+        bucket = os.environ.get("FLIGHTRIGHT_META_BUCKET") or os.environ.get("FLIGHTRIGHT_S3_BUCKET")
+        if not bucket:
+            # Don't crash the app; just log.
+            print("WARN: Missing FLIGHTRIGHT_META_BUCKET (or FLIGHTRIGHT_S3_BUCKET); skipping meta bootstrap.")
+            return
 
-    downloads = [
-        ("meta/aircraft_registry_clean.csv", Path("/data/meta/aircraft_registry_clean.csv")),
-        ("meta/airport_rankings/50_group_4_total.txt", Path("/data/meta/airport_rankings/50_group_4_total.txt")),
-    ]
-    ensure_meta_files(bucket=bucket, downloads=downloads)
+        downloads = [
+            ("meta/aircraft_registry_clean.csv", Path("/data/meta/aircraft_registry_clean.csv")),
+            ("meta/airport_rankings/50_group_4_total.txt", Path("/data/meta/airport_rankings/50_group_4_total.txt")),
+        ]
+        ensure_meta_files(bucket=bucket, downloads=downloads)
 
-
+    except Exception as e:
+        # Never prevent startup due to meta download issues
+        print(f"WARN: meta bootstrap failed: {e!r}")
 # -------------------------
 # Routers
 # -------------------------
