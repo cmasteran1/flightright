@@ -194,6 +194,20 @@ def _get_model_cached(
     return model, remote_dir_prefix, model_path_str
 
 
+def _safe_model_id(
+    airline: str,
+    n_airports: int,
+    years: str,
+    weatherflag: str,
+    histflag: str,
+) -> str:
+    """
+    Stable identifier for clients/logs that does NOT leak bucket names or on-disk paths.
+    Mirrors cli.RemoteModelSpec.dir_name.
+    """
+    return f"{airline}_{int(n_airports)}_{years}_{weatherflag}_{histflag}"
+
+
 # ----------------------------
 # Main entry: predict_departure
 # ----------------------------
@@ -210,7 +224,13 @@ def predict_departure(
     include_airport_stats: bool = True,
     include_airline_stats: bool = True,
     include_features: bool = False,
+    public_mode: bool = True,
 ) -> Dict[str, Any]:
+    """
+    public_mode:
+      - True  (default): safe for untrusted clients; do NOT leak S3 bucket/prefix or /data paths.
+      - False: admin/debug; include internal model_locator + remote_dir_prefix.
+    """
     airline_iata = _infer_airline_iata(airline)
     req = cli.RequestSpec(
         origin=origin,
@@ -328,16 +348,27 @@ def predict_departure(
     if isinstance(sev_score, (int, float)):
         pred["severity_band"] = _default_severity_band(float(sev_score))
 
+    # SAFE identifier (no S3, no /data paths)
+    model_id = _safe_model_id(
+        airline=req.airline_iata.upper(),
+        n_airports=int(n_airports),
+        years=str(cfg.model_defaults.model_years),
+        weatherflag=weatherflag,
+        histflag=histflag,
+    )
+
     out: Dict[str, Any] = {
         "ok": True,
         "chosen_model_family": model_family,
-        "model_locator": model_path_str,
-        "resolved_model_dir_spec": {
-            "airline": req.airline_iata.upper(),
-            "n_airports": int(n_airports),
-            "years": str(cfg.model_defaults.model_years),
-            "weatherflag": weatherflag,
-            "histflag": histflag,
+        "model": {
+            "id": model_id,
+            "resolved_model_dir_spec": {
+                "airline": req.airline_iata.upper(),
+                "n_airports": int(n_airports),
+                "years": str(cfg.model_defaults.model_years),
+                "weatherflag": weatherflag,
+                "histflag": histflag,
+            },
         },
         "availability": {
             "has_daily_weather": av.has_daily_weather,
@@ -360,6 +391,12 @@ def predict_departure(
             "airline_stats": {"airline": req.airline_iata.upper()} if include_airline_stats else None,
         },
     }
+
+    # Admin/debug-only internals
+    if not public_mode:
+        out["model_locator"] = model_path_str
+        out["remote_dir_prefix"] = remote_dir_prefix
+
     if include_features:
         out["features"] = features
 

@@ -226,7 +226,8 @@ def predict(inp: PredictIn, request: Request) -> Dict[str, Any]:
             include_flight_history=inp.include.flight_history,
             include_airport_stats=inp.include.airport_stats,
             include_airline_stats=inp.include.airline_stats,
-            include_features=False,  # public mode hides raw features
+            include_features=False,
+            public_mode=True,
         )
     except HTTPException:
         raise
@@ -255,6 +256,7 @@ def admin_predict(
             include_airport_stats=inp.include.airport_stats,
             include_airline_stats=inp.include.airline_stats,
             include_features=True,  # admin/debug includes raw features
+            public_mode=False,
         )
     except Exception as e:
         raise HTTPException(status_code=400, detail=str(e))
