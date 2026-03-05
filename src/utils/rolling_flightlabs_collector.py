@@ -12,7 +12,7 @@ Endpoint:
 - FlightLabs Flight Schedules API:
     https://app.goflightlabs.com/advanced-flights-schedules
 
-Reliability upgrades:
+Robustness upgrades:
 - requests.Session() connection pooling
 - separate (connect, read) timeouts
 - retry with exponential backoff + jitter for:
@@ -21,6 +21,11 @@ Reliability upgrades:
 
 Security upgrade:
 - redact access_key from any logged URLs
+
+NEW: Spread out call times
+- For each (airport, HH:MM slot), we add a deterministic per-airport offset
+  within a configurable window (default 20 minutes).
+- For late slots like 23:50, the window auto-shrinks so it never crosses midnight.
 """
 
 from __future__ import annotations
@@ -46,8 +51,12 @@ from zoneinfo import ZoneInfo
 
 # ----------------------------- config -----------------------------
 
-DEFAULT_RUN_TIMES = ["08:00", "16:00", "23:50"]  # local times
-DEFAULT_FINAL_TIME = "23:50"                     # which local time triggers daily merge/finalize
+DEFAULT_RUN_TIMES = ["08:00", "16:00", "23:50"]  # base local times
+DEFAULT_FINAL_TIME = "23:50"                     # which base time triggers daily merge/finalize
+
+# Spread window: how far after the base HH:MM we can schedule (per airport).
+# This is automatically clamped so we never cross midnight local time.
+DEFAULT_SPREAD_WINDOW_MINUTES = 20
 
 # Use a tuple timeout: (connect_timeout, read_timeout)
 CONNECT_TIMEOUT_S = 10
@@ -62,7 +71,7 @@ BACKOFF_BASE_S = 1.0
 BACKOFF_CAP_S = 30.0
 JITTER_S = 0.5
 
-# Small delay between calls to reduce burstiness
+# Small delay between calls to reduce burstiness further (still useful even with spread)
 INTER_CALL_SLEEP_S = 0.2
 
 
@@ -85,7 +94,6 @@ def redact_url(url: str, redact_keys: Tuple[str, ...] = ("access_key",)) -> str:
         new_query = urlencode(redacted, doseq=True)
         return urlunsplit((parts.scheme, parts.netloc, parts.path, new_query, parts.fragment))
     except Exception:
-        # If parsing fails, at least avoid leaking full URL
         return "<redacted-url>"
 
 
@@ -137,17 +145,6 @@ def parse_hhmm(s: str) -> Tuple[int, int]:
     return hh, mm
 
 
-def next_run_utc_for_time(tz_name: str, hour: int, minute: int) -> datetime:
-    tz = ZoneInfo(tz_name)
-    now_local = datetime.now(tz)
-
-    candidate = now_local.replace(hour=hour, minute=minute, second=0, microsecond=0)
-    if candidate <= now_local:
-        candidate += timedelta(days=1)
-
-    return candidate.astimezone(UTC)
-
-
 def _preview(text: str, n: int = 300) -> str:
     t = (text or "").strip()
     if len(t) <= n:
@@ -159,6 +156,54 @@ def _sleep_backoff(attempt: int) -> None:
     delay = min(BACKOFF_BASE_S * (2 ** (attempt - 1)), BACKOFF_CAP_S)
     delay += random.random() * JITTER_S
     time.sleep(delay)
+
+
+def deterministic_offset_seconds(airport: str, hhmm: str, max_seconds: int) -> int:
+    """
+    Deterministically map (airport, hhmm) -> offset in [0, max_seconds].
+    This spreads calls without relying on RNG and is stable across restarts.
+    """
+    if max_seconds <= 0:
+        return 0
+    seed = f"{airport}|{hhmm}".encode("utf-8")
+    h = hashlib.sha256(seed).digest()
+    n = int.from_bytes(h[:4], "big")  # 32-bit
+    return n % (max_seconds + 1)
+
+
+def next_run_utc_spread(
+    *,
+    tz_name: str,
+    airport: str,
+    hhmm: str,
+    spread_window_minutes: int,
+) -> datetime:
+    """
+    Compute the next UTC run time for a given base local HH:MM, plus a deterministic per-airport offset
+    within the spread window. The spread window is clamped so the run time never crosses midnight local.
+
+    Example: base 23:50 with a 20-min window becomes a max 9-min window (23:50..23:59).
+    """
+    tz = ZoneInfo(tz_name)
+    now_local = datetime.now(tz)
+
+    base_h, base_m = parse_hhmm(hhmm)
+    base_candidate = now_local.replace(hour=base_h, minute=base_m, second=0, microsecond=0)
+
+    # If base time has already passed today, start from tomorrow's base time.
+    if base_candidate <= now_local:
+        base_candidate += timedelta(days=1)
+
+    # Clamp spread so we never go past 23:59:59 local
+    minutes_from_midnight = base_h * 60 + base_m
+    remaining_minutes_today = (24 * 60 - 1) - minutes_from_midnight  # up to 23:59
+    allowed_minutes = max(0, min(spread_window_minutes, remaining_minutes_today))
+    max_seconds = allowed_minutes * 60
+
+    offset_s = deterministic_offset_seconds(airport, hhmm, max_seconds)
+    candidate = base_candidate + timedelta(seconds=offset_s)
+
+    return candidate.astimezone(UTC)
 
 
 # ----------------------------- HTTP / FlightLabs -----------------------------
@@ -179,7 +224,6 @@ def request_with_retries(
         try:
             r = session.request(method, url, params=params, timeout=timeout)
 
-            # Build redacted URL for logs (never log r.url raw)
             safe_url = redact_url(r.url)
 
             if should_retry_http(r.status_code):
@@ -354,18 +398,24 @@ class Scheduler:
         tz_map: Dict[str, str],
         run_times: List[str],
         final_time: str,
+        spread_window_minutes: int,
     ):
         self.tz_map = tz_map
         self.run_times = run_times
         self.final_time = final_time
+        self.spread_window_minutes = spread_window_minutes
         self.queue: List[ScheduledJob] = []
 
         for a in airports:
             if a not in tz_map:
                 raise ValueError(f"No timezone mapping for airport {a}")
             for hhmm in run_times:
-                hh, mm = parse_hhmm(hhmm)
-                run_at = next_run_utc_for_time(tz_map[a], hh, mm)
+                run_at = next_run_utc_spread(
+                    tz_name=tz_map[a],
+                    airport=a,
+                    hhmm=hhmm,
+                    spread_window_minutes=spread_window_minutes,
+                )
                 heapq.heappush(
                     self.queue,
                     ScheduledJob(run_at_utc=run_at, airport=a, hhmm=hhmm, is_final=(hhmm == final_time)),
@@ -375,8 +425,12 @@ class Scheduler:
         return heapq.heappop(self.queue)
 
     def reschedule(self, airport: str, hhmm: str, is_final: bool):
-        hh, mm = parse_hhmm(hhmm)
-        run_at = next_run_utc_for_time(self.tz_map[airport], hh, mm)
+        run_at = next_run_utc_spread(
+            tz_name=self.tz_map[airport],
+            airport=airport,
+            hhmm=hhmm,
+            spread_window_minutes=self.spread_window_minutes,
+        )
         heapq.heappush(self.queue, ScheduledJob(run_at_utc=run_at, airport=airport, hhmm=hhmm, is_final=is_final))
 
 
@@ -409,12 +463,19 @@ def main() -> int:
     p.add_argument(
         "--run-times",
         default=",".join(DEFAULT_RUN_TIMES),
-        help='Comma-separated local times HH:MM, e.g. "08:00,16:00,23:50"',
+        help='Comma-separated base local times HH:MM, e.g. "08:00,16:00,23:50"',
     )
     p.add_argument(
         "--final-time",
         default=DEFAULT_FINAL_TIME,
         help='Which HH:MM in --run-times counts as the final daily merge time (default "23:50")',
+    )
+    p.add_argument(
+        "--spread-window-minutes",
+        type=int,
+        default=DEFAULT_SPREAD_WINDOW_MINUTES,
+        help="Spread each airport's call within this many minutes AFTER each base HH:MM slot "
+             "(auto-clamped to avoid crossing midnight).",
     )
 
     args = p.parse_args()
@@ -426,6 +487,8 @@ def main() -> int:
         parse_hhmm(t)
     if args.final_time not in run_times:
         raise ValueError(f"--final-time {args.final_time} must be one of --run-times: {run_times}")
+    if args.spread_window_minutes < 0:
+        raise ValueError("--spread-window-minutes must be >= 0")
 
     airports = load_airports(Path(args.airports))
     tz_map = load_timezones(Path(args.timezones))
@@ -438,13 +501,15 @@ def main() -> int:
         tz_map=tz_map,
         run_times=run_times,
         final_time=args.final_time,
+        spread_window_minutes=args.spread_window_minutes,
     )
 
     session = requests.Session()
     session.headers.update({"Accept": "application/json", "User-Agent": "rolling_collector/1.0"})
 
     print(f"[INFO] Tracking {len(airports)} airports")
-    print(f"[INFO] Run times (local): {run_times} | final={args.final_time}")
+    print(f"[INFO] Base run times (local): {run_times} | final={args.final_time}")
+    print(f"[INFO] Spread window minutes: {args.spread_window_minutes} (per airport per slot, after base time)")
     print("[INFO] Collector started")
 
     while True:
@@ -460,6 +525,7 @@ def main() -> int:
         local_now = datetime.now(tz)
         local_date = local_now.date()
 
+        # Show base hhmm; actual scheduled time is job.run_at_utc (hidden here to keep logs tidy)
         print(f"[RUN] {airport} local_date={local_date} hhmm={job.hhmm} type={args.flight_type} final={job.is_final}")
 
         try:
@@ -487,7 +553,7 @@ def main() -> int:
                     {
                         "airport": airport,
                         "local_date": local_date.isoformat(),
-                        "hhmm_local": job.hhmm,
+                        "hhmm_local": job.hhmm,  # base slot label
                         "fetched_at_utc": datetime.now(UTC).isoformat(),
                         "endpoint": "advanced-flights-schedules",
                         "request": {
