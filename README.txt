@@ -30,3 +30,6 @@ Currently, the deployment lives in flightright/src/flightright. Here, various fe
 be pulled from open-meteo. The main workhorse is flightright/cli/predict.py. This executable verifies that a flight exists, based on the future flights endpoint. Then tries to find the recent flight history based
 on the flight #. Then searches for daily and hourly forcast data. In the future, it will also search for airport and carrier history as soon as we can build up enough historical data to be meaningful.
 Based on the available data, a model is chosen. The chosen model is then optionally found through external storage on a VM and downloaded. This can now output prediction bins as well as various meaningful features.
+
+Users can now test out the deployment from a website: https://flightrightus.com/  . This site currently supports computing delay probability for a large amount of southwest and american airlines flights from popular US
+destinations. Also reports various features that are used.
