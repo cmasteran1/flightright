@@ -532,6 +532,95 @@
         }[c]));
       }
 
+      function normalizePredictError(status, data, fallbackMessage){
+        const raw =
+          String(
+            data?.user_message ||
+            data?.detail ||
+            data?.error ||
+            fallbackMessage ||
+            ""
+          ).trim();
+
+        const lower = raw.toLowerCase();
+
+        if (data?.user_title || data?.user_message || data?.user_action) {
+          return {
+            title: data.user_title || "We couldn’t run this prediction",
+            message: data.user_message || "We were not able to generate a delay estimate for this flight.",
+            action: data.user_action || "Please double-check the flight details and try again."
+          };
+        }
+
+        if (status === 400) {
+          if (lower.includes("same-day") || lower.includes("same day") || lower.includes("today")) {
+            return {
+              title: "Prediction not available for today",
+              message: "This tool works best for flights scheduled for tomorrow or later, and could not produce a reliable prediction for this date.",
+              action: "Try checking the same flight for a later date."
+            };
+          }
+
+          if (lower.includes("flight not found") || lower.includes("not found")) {
+            return {
+              title: "We couldn’t find that flight",
+              message: "The flight details did not match a scheduled flight for the date you entered.",
+              action: "Check the airline code, flight number, origin, destination, and date, then try again."
+            };
+          }
+
+          return {
+            title: "Please check the flight details",
+            message: "We couldn’t run the prediction because some of the flight information did not match what the system expected.",
+            action: "Make sure the airline, flight number, airports, and date are correct, then try again."
+          };
+        }
+
+        if (status === 404) {
+          return {
+            title: "We couldn’t find data for this flight",
+            message: "The system could not find the flight or the supporting data needed to make a prediction.",
+            action: "Verify the flight details or try a different date."
+          };
+        }
+
+        if (status === 422) {
+          return {
+            title: "Not enough information to make a prediction",
+            message: "We found the request, but there was not enough valid data to generate a reliable result.",
+            action: "Try a different date or check back later."
+          };
+        }
+
+        if (status === 502 || status === 503 || status === 504) {
+          return {
+            title: "Temporary service problem",
+            message: "FlightRight had trouble reaching the prediction service.",
+            action: "Please try again in a minute."
+          };
+        }
+
+        return {
+          title: "We couldn’t run this prediction",
+          message: raw || "We were not able to generate a delay estimate for this flight.",
+          action: "Please try again. If the problem continues, double-check the flight details."
+        };
+      }
+
+      function renderPredictError(err){
+        const title = safeText(err?.title || "We couldn’t run this prediction");
+        const message = safeText(err?.message || "We were not able to generate a delay estimate.");
+        const action = safeText(err?.action || "Please try again.");
+
+        return `
+          <div class="empty" role="alert" aria-live="polite">
+            <div style="font-weight:700; font-size:1.05rem; margin-bottom:8px;">${title}</div>
+            <div style="margin-bottom:8px;">${message}</div>
+            <div class="small muted">${action}</div>
+          </div>
+        `;
+      }
+
       function todayISO(){
         const d = new Date();
         const tz = d.getTimezoneOffset() * 60000;
@@ -749,8 +838,11 @@
           try { data = JSON.parse(txt); } catch { /* ignore */ }
 
           if (!r.ok){
-            const msg = (data && (data.detail || data.error)) ? (data.detail || data.error) : ("Request failed (" + r.status + ")");
-            throw new Error(msg);
+            throw normalizePredictError(
+              r.status,
+              data,
+              "Request failed (" + r.status + ")"
+            );
           }
 
           state.lastResponse = data;
@@ -765,7 +857,7 @@
           render();
         }catch(e){
           state.lastResponse = null;
-          content.innerHTML = `<div class="empty">Couldn’t run prediction: <b>${safeText(e.message)}</b></div>`;
+          content.innerHTML = renderPredictError(e);
         }finally{
           goBtn.disabled = false;
           goBtn.textContent = "Get delay risk";

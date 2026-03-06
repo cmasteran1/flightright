@@ -1,9 +1,11 @@
-# src/flightright/api/app.py
 from __future__ import annotations
 
+import logging
 import os
 import shutil
 import time
+import traceback
+import uuid
 from dataclasses import dataclass
 from datetime import date, datetime, timezone
 from pathlib import Path
@@ -22,6 +24,12 @@ from flightright.service.predictor import (
     ServiceConfig,
     predict_departure,
 )
+
+# -------------------------
+# Logging
+# -------------------------
+logging.basicConfig(level=os.getenv("LOG_LEVEL", "INFO").upper())
+logger = logging.getLogger("flightright.api")
 
 # -------------------------
 # Environment
@@ -48,6 +56,66 @@ def _env(key: str, default: Optional[str] = None) -> Optional[str]:
     return v if v is not None and v != "" else default
 
 
+def _new_request_id() -> str:
+    return uuid.uuid4().hex[:12]
+
+
+def _debug_allowed(x_admin_key: Optional[str]) -> bool:
+    want = _env("FLIGHTRIGHT_ADMIN_KEY")
+    return bool(want and x_admin_key and x_admin_key == want)
+
+
+def _client_host(req: Request) -> str:
+    return req.client.host if req.client else "unknown"
+
+
+def _log_predict_exception(
+    *,
+    request_id: str,
+    route_name: str,
+    request: Request,
+    inp: "PredictIn",
+    exc: Exception,
+) -> None:
+    logger.exception(
+        "predict failure request_id=%s route=%s client=%s airline=%s flightnum=%s date=%s origin=%s dest=%s include_weather=%s include_flight_history=%s include_airport_stats=%s include_airline_stats=%s exc_type=%s exc=%s",
+        request_id,
+        route_name,
+        _client_host(request),
+        inp.airline,
+        inp.flightnum,
+        inp.date.isoformat(),
+        inp.origin,
+        inp.dest,
+        inp.include.weather,
+        inp.include.flight_history,
+        inp.include.airport_stats,
+        inp.include.airline_stats,
+        type(exc).__name__,
+        str(exc),
+    )
+
+
+def _public_error_payload(
+    *,
+    request_id: str,
+    user_title: str,
+    user_message: str,
+    user_action: str,
+    debug_detail: Optional[str] = None,
+) -> Dict[str, Any]:
+    payload: Dict[str, Any] = {
+        "ok": False,
+        "request_id": request_id,
+        "user_title": user_title,
+        "user_message": user_message,
+        "user_action": user_action,
+    }
+    if debug_detail and not IS_PROD:
+        payload["debug_detail"] = debug_detail
+    return payload
+
+
 # -------------------------
 # Authorization (X-API-Key)
 # -------------------------
@@ -57,12 +125,16 @@ _api_key_header = APIKeyHeader(name="X-API-Key", auto_error=False)
 def require_api_key(x_api_key: Optional[str] = Depends(_api_key_header)) -> None:
     """
     Require X-API-Key for protected endpoints.
+
     - If FLIGHTRIGHT_API_KEY is not set on the server: fail closed with 500.
     - If wrong/missing key: 401.
     """
     want = _env("FLIGHTRIGHT_API_KEY")
     if not want:
-        raise HTTPException(status_code=500, detail="Server auth not configured (missing FLIGHTRIGHT_API_KEY).")
+        raise HTTPException(
+            status_code=500,
+            detail="Server auth not configured (missing FLIGHTRIGHT_API_KEY).",
+        )
     if not x_api_key or x_api_key != want:
         raise HTTPException(status_code=401, detail="Unauthorized.")
 
@@ -86,19 +158,19 @@ def build_config() -> ServiceConfig:
     # IMPORTANT for Fly volume: mount persistent storage at /data
     airports_csv = Path(_env("FLIGHTRIGHT_AIRPORTS_CSV", "/data/meta/airports.csv"))
     rankings_dir = Path(_env("FLIGHTRIGHT_RANKINGS_DIR", "/data/meta/airport_rankings"))
-
     s3_bucket = _env("FLIGHTRIGHT_S3_BUCKET", "")
     s3_prefix = _env("FLIGHTRIGHT_S3_PREFIX", "models/")
     s3_endpoint = _env("E2_ENDPOINT") or _env("FLIGHTRIGHT_S3_ENDPOINT")
-
     remote_cache_dir = Path(_env("FLIGHTRIGHT_REMOTE_CACHE_DIR", "/data/remote_models_cache"))
-
     airports_n = int(_env("FLIGHTRIGHT_AIRPORTS_N", "50"))
     model_years = _env("FLIGHTRIGHT_MODEL_YEARS", "23-25") or "23-25"
 
     return ServiceConfig(
         flightlabs_access_key=access_key,
-        data_paths=DataPaths(airports_csv=airports_csv, airport_rankings_dir=rankings_dir),
+        data_paths=DataPaths(
+            airports_csv=airports_csv,
+            airport_rankings_dir=rankings_dir,
+        ),
         remote_models=RemoteModelConfig(
             use_remote_models=True,
             s3_bucket=s3_bucket,
@@ -127,7 +199,7 @@ class Bucket:
 
 RATE_STATE: Dict[str, Bucket] = {}
 RATE_PER_MIN = float(_env("FLIGHTRIGHT_RPM", "6"))  # 6 / min
-BURST = float(_env("FLIGHTRIGHT_BURST", "3"))       # allow short bursts
+BURST = float(_env("FLIGHTRIGHT_BURST", "3"))  # allow short bursts
 
 
 def _take_token(key: str) -> None:
@@ -197,8 +269,8 @@ def _startup_bootstrap_meta() -> None:
 
 # -------------------------
 # Routers
-#   - public: no auth
-#   - protected: require X-API-Key
+# - public: no auth
+# - protected: require X-API-Key
 # -------------------------
 public = APIRouter()
 protected = APIRouter(dependencies=[Depends(require_api_key)])
@@ -215,8 +287,13 @@ def health() -> Dict[str, Any]:
 
 
 @protected.post("/predict")
-def predict(inp: PredictIn, request: Request) -> Dict[str, Any]:
+def predict(
+    inp: PredictIn,
+    request: Request,
+    x_admin_key: Optional[str] = Header(default=None, alias="X-Admin-Key"),
+) -> Dict[str, Any]:
     _take_token(_client_key(request))
+    request_id = _new_request_id()
 
     try:
         return predict_departure(
@@ -230,14 +307,42 @@ def predict(inp: PredictIn, request: Request) -> Dict[str, Any]:
             include_flight_history=inp.include.flight_history,
             include_airport_stats=inp.include.airport_stats,
             include_airline_stats=inp.include.airline_stats,
-            include_features=False,   # never for public
-            public_mode=True,         # prevents model_locator leaks
+            include_features=False,  # never for public
+            public_mode=True,        # prevents model_locator leaks
         )
     except HTTPException:
         raise
-    except Exception:
-        # Do not leak internals/paths; keep the error generic for public users
-        raise HTTPException(status_code=400, detail="Bad request.")
+    except Exception as e:
+        _log_predict_exception(
+            request_id=request_id,
+            route_name="/predict",
+            request=request,
+            inp=inp,
+            exc=e,
+        )
+
+        debug = _debug_allowed(x_admin_key)
+        if debug:
+            raise HTTPException(
+                status_code=400,
+                detail={
+                    "request_id": request_id,
+                    "error_type": type(e).__name__,
+                    "error": str(e),
+                    "traceback": traceback.format_exc(),
+                },
+            )
+
+        raise HTTPException(
+            status_code=400,
+            detail=_public_error_payload(
+                request_id=request_id,
+                user_title="We couldn’t run this prediction",
+                user_message="We were not able to generate a delay estimate for this flight.",
+                user_action="Please double-check the airline, flight number, airports, and date, then try again.",
+                debug_detail=str(e),
+            ),
+        )
 
 
 @protected.post("/admin/predict")
@@ -248,6 +353,7 @@ def admin_predict(
 ) -> Dict[str, Any]:
     _require_admin(x_admin_key)
     _take_token(_client_key(request))  # still rate-limit admin by default
+    request_id = _new_request_id()
 
     try:
         return predict_departure(
@@ -261,11 +367,28 @@ def admin_predict(
             include_flight_history=inp.include.flight_history,
             include_airport_stats=inp.include.airport_stats,
             include_airline_stats=inp.include.airline_stats,
-            include_features=True,    # admin/debug includes raw features
-            public_mode=False,        # admin gets internal model_locator
+            include_features=True,   # admin/debug includes raw features
+            public_mode=False,       # admin gets internal model_locator
         )
+    except HTTPException:
+        raise
     except Exception as e:
-        raise HTTPException(status_code=400, detail=str(e))
+        _log_predict_exception(
+            request_id=request_id,
+            route_name="/admin/predict",
+            request=request,
+            inp=inp,
+            exc=e,
+        )
+        raise HTTPException(
+            status_code=400,
+            detail={
+                "request_id": request_id,
+                "error_type": type(e).__name__,
+                "error": str(e),
+                "traceback": traceback.format_exc(),
+            },
+        )
 
 
 @protected.post("/admin/warm")
@@ -291,7 +414,11 @@ def admin_warm(
     remote_dir_prefix = store.find_remote_model_dir_prefix(spec)
     model_path = store.download_deploy_joblib(remote_dir_prefix)
 
-    return {"ok": True, "remote_dir_prefix": remote_dir_prefix, "cached_model_path": str(model_path)}
+    return {
+        "ok": True,
+        "remote_dir_prefix": remote_dir_prefix,
+        "cached_model_path": str(model_path),
+    }
 
 
 @protected.get("/admin/cache")
@@ -300,9 +427,10 @@ def admin_cache(
 ) -> Dict[str, Any]:
     """
     Report what's on disk in the remote model cache.
+
     Requires BOTH:
-      - X-API-Key (router dependency)
-      - X-Admin-Key (this handler)
+    - X-API-Key (router dependency)
+    - X-Admin-Key (this handler)
     """
     _require_admin(x_admin_key)
 
@@ -320,6 +448,7 @@ def admin_cache(
             for p in cache_root.rglob(pat):
                 if not p.is_file():
                     continue
+
                 # de-dupe in case patterns overlap
                 rp = str(p.resolve())
                 if rp in seen:
@@ -332,7 +461,9 @@ def admin_cache(
                     {
                         "path": str(p.relative_to(cache_root)),
                         "bytes": int(st.st_size),
-                        "modified_utc": datetime.fromtimestamp(st.st_mtime, tz=timezone.utc).isoformat(),
+                        "modified_utc": datetime.fromtimestamp(
+                            st.st_mtime, tz=timezone.utc
+                        ).isoformat(),
                     }
                 )
 
@@ -341,9 +472,19 @@ def admin_cache(
     # Disk usage (best effort)
     try:
         du = shutil.disk_usage("/data")
-        disk = {"path": "/data", "total_bytes": int(du.total), "used_bytes": int(du.used), "free_bytes": int(du.free)}
+        disk = {
+            "path": "/data",
+            "total_bytes": int(du.total),
+            "used_bytes": int(du.used),
+            "free_bytes": int(du.free),
+        }
     except Exception:
-        disk = {"path": "/data", "total_bytes": None, "used_bytes": None, "free_bytes": None}
+        disk = {
+            "path": "/data",
+            "total_bytes": None,
+            "used_bytes": None,
+            "free_bytes": None,
+        }
 
     return {
         "ok": True,
