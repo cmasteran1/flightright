@@ -1,0 +1,79 @@
+{
+  "target": "arr",
+
+  "input_flights_path": [
+  "../flightrightdata/data/raw_bts/Year=2024/Month=*/flights.parquet",
+  "../flightrightdata/data/raw_bts/Year=2025/Month=0[1-6]/flights.parquet"
+],
+"history_flights_path": [
+  "../flightrightdata/data/raw_bts/Year=2023/Month=1[1-2]/flights.parquet",
+  "../flightrightdata/data/raw_bts/Year=2024/Month=*/flights.parquet",
+  "../flightrightdata/data/raw_bts/Year=2025/Month=0[1-6]/flights.parquet"
+],
+
+  "airports_csv": "../flightrightdata/data/meta/airports.csv",
+  "airports_filter_csv": "../flightrightdata/data/meta/airport_rankings/WN_top_50.csv",
+  "airports_filter_column": "IATA",
+  "airlines": ["WN"],
+
+  "start_date": "2024-01-01",
+  "end_date": "2025-06-30",
+
+  "weather": {
+  "daily": true,
+  "hourly_at_dep": true,
+  "dest_daily": true,
+  "dest_hourly_at_arr": true,
+  "cache_dir": "weather_cache",
+  "hourly_cache_dir": "weather_cache_hourly",
+  "dest_cache_dir": "weather_cache_dest",
+  "dest_hourly_cache_dir": "weather_cache_dest_hourly"
+},
+
+  "add_aircraft_age": true,
+  "aircraft_registry_csv": "../flightrightdata/data/meta/aircraft_registry_clean.csv",
+
+  "output_enriched_unbalanced_path": "../flightrightdata/data/intermediate/WN_50_23-25_unbalanced.parquet",
+
+  "history_lookback_days": 60,
+  "history_output_path": "../flightrightdata/data/intermediate/history_pool_arr_WN_50_23-25.parquet",
+
+  "features_dep": {
+    "holiday_windows": {
+      "thanksgiving": 2,
+      "christmas": 3
+    },
+    "n_recent_flightnum_od": 20,
+    "n_days_flightnum_od": 14,
+    "low_support_leq": 2,
+    "n_days_carrier_network": 14,
+  "add_aircraft_type": true,
+  "faa_registry": {
+    "master_path": "../flightrightdata/data/meta/master.txt",
+    "acftref_path": "../flightrightdata/data/meta/acftref.txt"
+  }
+
+  },
+  "output_features_unbalanced_path": "../flightrightdata/data/processed/features_arr_WN_50_23-25_unbalanced.parquet",
+  "dep_features_unbalanced_path": "../flightrightdata/data/processed/features_dep_WN_50_23-25_unbalanced.parquet",
+
+  "balance": {
+    "thresholds": [15, 30, 45, 60],
+    "delay_col": "DepDelayMinutes"
+  },
+
+  "feature_balance": {
+    "enabled": true,
+    "eval": {
+      "enabled": true,
+      "by": "last_days",
+      "last_days": 90,
+      "output_path": "../flightrightdata/data/processed/features_arr_WN_50_23-25_eval_unbalanced.parquet"
+    },
+    "thresholds": [15, 30, 45, 60],
+    "pos_frac": 0.50,
+    "seed": 42,
+    "max_rows": 20000,
+    "output_template": "../flightrightdata/data/processed/train_arr_ge{thr}_balanced_WN_50_23-25.parquet"
+  }
+}

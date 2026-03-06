@@ -1,0 +1,61 @@
+{
+  "target": "arr",
+
+  "input_features_path": "../flightrightdata/data/processed/features_arr_WN_50_23-25_unbalanced.parquet",
+  "outdir": "../flightrightdata/data/models/arr_WN/",
+
+  "thresholds": [15, 30, 45, 60],
+
+  "feature_balance": {
+    "output_template": "../flightrightdata/data/processed/train_arr_ge{thr}_balanced_WN_50_23-25.parquet"
+  },
+
+  "eval": {
+    "last_days": 90,
+    "calibration_frac_from_train": 0.15
+  },
+
+  "training": {
+    "max_train_rows": 20000,
+    "seed": 1337,
+    "exclude_feature_prefixes": ["y_dep_ge"],
+    "exclude_feature_columns": []
+  },
+
+  "features": {
+    "categorical": ["Reporting_Airline", "Origin", "Dest", "DepTimeBlk", "aircraft_type", "Aircraft_Age_Bucket"],
+    "numeric": [
+      "CRSDepTime", "CRSArrTime",
+      "arrdelay_mean_7d_fn_od", "arrdelay_n_7d_fn_od",
+      "arrdelay_mean_14d_fn_od", "arrdelay_n_14d_fn_od",
+      "arrdelay_median_7d_fn_od",
+      "arrdelay_mean_7d_car_od", "arrdelay_n_7d_car_od",
+      "arrdelay_mean_14d_car_od", "arrdelay_n_14d_car_od",
+      "arrdelay_median_7d_car_od",
+      "airtime_mean_7d_fn_od", "airtime_n_7d_fn_od",
+      "airtime_mean_14d_fn_od", "airtime_n_14d_fn_od",
+      "airtime_mean_7d_car_od", "airtime_n_7d_car_od",
+      "airtime_mean_14d_car_od", "airtime_n_14d_car_od",
+      "wo_slip_mean_7d_fn_od", "wo_slip_n_7d_fn_od",
+      "wo_slip_mean_14d_fn_od", "wo_slip_n_14d_fn_od",
+      "wo_slip_mean_7d_origin_blk", "wo_slip_n_7d_origin_blk",
+      "wo_slip_mean_14d_origin_blk", "wo_slip_n_14d_origin_blk",
+      "dest_arrivals_pm60_sched", "dest_airline_arrivals_pm60_sched",
+      "dest_arrivals_pm60_eta", "dest_airline_arrivals_pm60_eta"
+    ]
+  },
+
+  "catboost": {
+    "iterations": 1200,
+    "depth": 8,
+    "learning_rate": 0.08,
+    "l2_leaf_reg": 3.0,
+    "seed": 1337,
+    "verbose": 200,
+    "thread_count": -1
+  },
+
+  "deploy_bundle_joblib_name": "arr_delay_bins_bundle_WN_50_23-25.joblib",
+  "eval_output_parquet_name": "arr_eval_with_probs_WN_50_23-25.parquet",
+  "metrics_output_json_name": "arr_train_metrics_WN_50_23-25.json"
+}

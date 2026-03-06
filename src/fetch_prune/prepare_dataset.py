@@ -4,9 +4,15 @@
 # Run from REPO_ROOT:
 #   python src/fetch_prune/prepare_dataset.py data/dep_arr_config.json
 #
+# Changes included (for arrival models):
+#  - Destination weather (daily + hourly at scheduled arrival) via Open-Meteo archive (actual weather)
+#  - History pool expanded to include arrival-relevant columns (ArrDelayMinutes, AirTime, WheelsOff, etc.)
+#  - History pool now includes both dep_dt_local and arr_dt_local (scheduled, local tz)
+
 import sys
 import json
 import glob
+import csv
 from pathlib import Path
 from datetime import datetime, time as dtime, timedelta
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
@@ -15,10 +21,8 @@ from typing import Optional, List, Dict, Tuple, Set
 import numpy as np
 import pandas as pd
 
-
 REPO_ROOT = Path.cwd()  # you always run from REPO_ROOT
 DATA_ROOT = (REPO_ROOT.parent / "flightrightdata").resolve()
-
 
 # ------------------------------ path helpers ------------------------------
 
@@ -32,7 +36,6 @@ def _abspath(p: str, *, base: str = "repo") -> Path:
     pp = Path(p)
     if pp.is_absolute():
         return pp
-
     if base == "repo":
         return (REPO_ROOT / pp).resolve()
     if base == "data":
@@ -73,15 +76,13 @@ def _parse_date_strict(s: str, field: str) -> pd.Timestamp:
 
 # ------------------------------ airport filter list (CSV) ------------------------------
 
-import csv
-
 def _load_airport_filter_set(cfg: dict) -> Optional[Set[str]]:
     """
     Airport filtering is driven by a CSV-ish file path in config.
 
     Supports:
-      1) Single line:  "DEN","LAS","MDW",...
-      2) One-per-line: DEN\\nLAS\\nMDW\\n...
+      1) Single line: "DEN","LAS","MDW",...
+      2) One-per-line: DEN\nLAS\nMDW\n...
       3) Standard CSV with a column (optionally named by cfg["airports_filter_column"])
     """
     p_raw = (cfg.get("airports_filter_csv") or "").strip()
@@ -111,7 +112,8 @@ def _load_airport_filter_set(cfg: dict) -> Optional[Set[str]]:
     if want_col:
         want_col_u = want_col.upper()
         first_line = text.splitlines()[0]
-        if want_col_u in [c.strip().strip('"').strip("'").upper() for c in next(csv.reader([first_line]))]:
+        first_header = [c.strip().strip('"').strip("'").upper() for c in next(csv.reader([first_line]))]
+        if want_col_u in first_header:
             rows = list(csv.reader(text.splitlines(), skipinitialspace=True))
             header = [h.strip().strip('"').strip("'").upper() for h in rows[0]]
             try:
@@ -134,7 +136,6 @@ def _load_airport_filter_set(cfg: dict) -> Optional[Set[str]]:
     bad = sorted([a for a in airports if len(a) != 3])
     if bad:
         print(f"[WARN] airports_filter_csv contains non-3-letter tokens (showing up to 20): {bad[:20]}")
-
     return airports
 
 
@@ -170,30 +171,116 @@ def canonicalize_bts_columns(df: pd.DataFrame) -> pd.DataFrame:
     for col in ["Reporting_Airline", "Origin", "Dest", "Tail_Number"]:
         if col in df.columns:
             df[col] = df[col].astype(str)
-
     return df
 
 
-def read_input_parquet(input_flights_path: List[str]) -> pd.DataFrame:
+def read_input_parquet(input_flights_path: List[str], cfg: Optional[dict] = None, airports_set: Optional[Set[str]] = None) -> pd.DataFrame:
+    """
+    Memory-safe reader: reads files one at a time and filters early.
+
+    This prevents OOM when input patterns match many monthly BTS parquets.
+    """
+    cfg = cfg or {}
     files = _expand_inputs(input_flights_path)
     if not files:
         raise FileNotFoundError(
             "No parquet files found for cfg['input_flights_path'] patterns.\n"
             f"Patterns={input_flights_path}"
         )
-    dfs = []
+
+    # Parse filters once
+    airlines = cfg.get("airlines") or None
+    single_airline = cfg.get("single_airline") or None
+    start = pd.to_datetime(cfg.get("start_date"), errors="coerce") if cfg.get("start_date") else None
+    end = pd.to_datetime(cfg.get("end_date"), errors="coerce") if cfg.get("end_date") else None
+    if start is not None and not pd.isna(start):
+        start = start.normalize()
+    else:
+        start = None
+    if end is not None and not pd.isna(end):
+        end = end.normalize()
+    else:
+        end = None
+
+    # Keep only columns we actually need for enrichment + history pool
+    # (This cuts memory a LOT. Add columns here if you later find you need more.)
+    keep_cols = {
+        "FlightDate",
+        "Reporting_Airline",
+        "Flight_Number_Reporting_Airline",
+        "Origin",
+        "Dest",
+        "CRSDepTime",
+        "CRSArrTime",
+        "DepDelayMinutes",
+        "ArrDelayMinutes",
+        "DepDel15",
+        "ArrDel15",
+        "Tail_Number",
+        "AirTime",
+        "WheelsOff",
+        "WheelsOn",
+        "TaxiOut",
+        "TaxiIn",
+        "DepTimeBlk",
+    }
+
+    out_parts: List[pd.DataFrame] = []
+    kept_rows = 0
+    read_rows = 0
+
     for fp in files:
         print(f"[INFO] Reading: {fp}")
-        dfs.append(pd.read_parquet(fp))
-    return pd.concat(dfs, ignore_index=True)
+        df = pd.read_parquet(fp)
 
+        read_rows += len(df)
 
+        df = canonicalize_bts_columns(df)
+
+        # Column pruning early
+        cols_present = [c for c in df.columns if c in keep_cols]
+        df = df[cols_present].copy()
+
+        # Basic normalization for filters
+        if "FlightDate" in df.columns:
+            df["FlightDate"] = pd.to_datetime(df["FlightDate"], errors="coerce")
+        if "Reporting_Airline" in df.columns:
+            df["Reporting_Airline"] = df["Reporting_Airline"].astype(str).str.upper().str.strip()
+        if "Origin" in df.columns:
+            df["Origin"] = df["Origin"].astype(str).str.upper().str.strip()
+        if "Dest" in df.columns:
+            df["Dest"] = df["Dest"].astype(str).str.upper().str.strip()
+
+        # Early filters (massive memory savings)
+        if start is not None and end is not None and "FlightDate" in df.columns:
+            df = df[(df["FlightDate"] >= start) & (df["FlightDate"] <= end)]
+
+        if single_airline and "Reporting_Airline" in df.columns:
+            df = df[df["Reporting_Airline"] == single_airline]
+        elif airlines and "Reporting_Airline" in df.columns:
+            df = df[df["Reporting_Airline"].isin([a.upper() for a in airlines])]
+
+        if airports_set is not None and "Origin" in df.columns and "Dest" in df.columns:
+            df = df[df["Origin"].isin(airports_set) & df["Dest"].isin(airports_set)]
+
+        if df.empty:
+            continue
+
+        kept_rows += len(df)
+        out_parts.append(df)
+
+    if not out_parts:
+        return pd.DataFrame()
+
+    print(f"[INFO] read_rows={read_rows:,} kept_rows={kept_rows:,} after early filtering")
+    return pd.concat(out_parts, ignore_index=True)
 # ------------------------------ airport metadata ------------------------------
 
 def load_airport_meta(airports_csv_path: str) -> pd.DataFrame:
     p = _abspath(airports_csv_path, base="repo")
     if not p.exists():
         raise FileNotFoundError(f"airports_csv not found: {p}")
+
     meta = pd.read_csv(p, dtype=str)
     required = {"IATA", "Latitude", "Longitude", "Timezone"}
     missing = required - set(meta.columns)
@@ -205,7 +292,6 @@ def load_airport_meta(airports_csv_path: str) -> pd.DataFrame:
     meta["Latitude"] = pd.to_numeric(meta["Latitude"], errors="coerce")
     meta["Longitude"] = pd.to_numeric(meta["Longitude"], errors="coerce")
     meta["Timezone"] = meta["Timezone"].astype(str).str.strip()
-
     meta.loc[meta["Timezone"].str.lower().isin(["nan", "none", ""]), "Timezone"] = np.nan
     return meta
 
@@ -217,7 +303,6 @@ def _validate_tz_strings_for_needed(
     airports_csv_for_msg: Optional[Path] = None,
 ) -> Dict[str, Tuple[float, float, str]]:
     m = meta.set_index("IATA", drop=False)
-
     bad = []
     out: Dict[str, Tuple[float, float, str]] = {}
     for ap in needed_iata:
@@ -228,7 +313,6 @@ def _validate_tz_strings_for_needed(
         lat = row["Latitude"]
         lon = row["Longitude"]
         tz = row["Timezone"]
-
         if pd.isna(lat) or pd.isna(lon):
             bad.append((ap, f"BAD_LATLON({lat},{lon})"))
             continue
@@ -240,12 +324,11 @@ def _validate_tz_strings_for_needed(
         except ZoneInfoNotFoundError:
             bad.append((ap, f"UNRECOGNIZED_TZ({tz!r})"))
             continue
-
         out[ap] = (float(lat), float(lon), str(tz))
 
     if bad:
         examples = ", ".join([f"{a}:{why}" for a, why in bad[:40]])
-        csv_msg = str(airports_csv_for_msg) if airports_csv_for_msg is not None else "<unknown>"
+        csv_msg = str(airports_csv_for_msg) if airports_csv_for_msg is not None else ""
         raise RuntimeError(
             "[AIRPORT META ERROR] Bad airport metadata for airports required by your filtered dataset.\n"
             f"airports_csv={csv_msg}\n"
@@ -273,7 +356,6 @@ def add_timezone_local_times(df: pd.DataFrame, airports_meta: Dict[str, Tuple[fl
     df = df.copy()
     df["Origin"] = df["Origin"].astype(str).str.upper()
     df["Dest"] = df["Dest"].astype(str).str.upper()
-
     df["Origin_TZ"] = df["Origin"].map(lambda a: airports_meta[a][2])
     df["Dest_TZ"] = df["Dest"].map(lambda a: airports_meta[a][2])
 
@@ -282,6 +364,7 @@ def add_timezone_local_times(df: pd.DataFrame, airports_meta: Dict[str, Tuple[fl
         dep_dt = _mk_local_dt(getattr(r, "FlightDate"), getattr(r, "CRSDepTime"), getattr(r, "Origin_TZ"))
         arr_dt = _mk_local_dt(getattr(r, "FlightDate"), getattr(r, "CRSArrTime"), getattr(r, "Dest_TZ"))
 
+        # Handle scheduled arrival after midnight relative to scheduled departure
         if dep_dt and arr_dt:
             try:
                 dep_hhmm = getattr(r, "CRSDepTime")
@@ -316,15 +399,42 @@ def _add_dep_dt_local_for_history_pool(
         return h
 
     tz_map = {k: v[2] for k, v in airports_meta.items()}
-
     dep_locals = []
-    for r in h[["FlightDate", "CRSDepTime", "Origin"]].itertuples(index=False, name=None):
-        fd0, t0, o0 = r
+    for fd0, t0, o0 in h[["FlightDate", "CRSDepTime", "Origin"]].itertuples(index=False, name=None):
         tz = tz_map.get(str(o0).upper())
         dep_locals.append(_mk_local_dt(fd0, t0, tz) if tz is not None else None)
 
     h["dep_dt_local"] = dep_locals
     h["dep_local_date"] = h["dep_dt_local"].apply(lambda x: x.date() if isinstance(x, datetime) else pd.NaT)
+    return h
+
+
+def _add_arr_dt_local_for_history_pool(
+    hist: pd.DataFrame,
+    airports_meta: Dict[str, Tuple[float, float, str]],
+) -> pd.DataFrame:
+    """
+    Adds scheduled arr_dt_local + arr_local_date to the history pool, using CRSArrTime and Dest timezone.
+    """
+    h = hist.copy()
+    h["Dest"] = h.get("Dest", "").astype(str).str.upper()
+    h["FlightDate"] = pd.to_datetime(h.get("FlightDate"), errors="coerce")
+    if "CRSArrTime" in h.columns:
+        h["CRSArrTime"] = pd.to_numeric(h["CRSArrTime"], errors="coerce")
+    else:
+        h["arr_dt_local"] = pd.NaT
+        h["arr_local_date"] = pd.NaT
+        return h
+
+    tz_map = {k: v[2] for k, v in airports_meta.items()}
+    arr_locals = []
+    for fd0, t0, d0 in h[["FlightDate", "CRSArrTime", "Dest"]].itertuples(index=False, name=None):
+        tz = tz_map.get(str(d0).upper())
+        arr_locals.append(_mk_local_dt(fd0, t0, tz) if tz is not None else None)
+
+    # midnight wrap compared to departure isn't available here; best-effort only
+    h["arr_dt_local"] = arr_locals
+    h["arr_local_date"] = h["arr_dt_local"].apply(lambda x: x.date() if isinstance(x, datetime) else pd.NaT)
     return h
 
 
@@ -350,7 +460,7 @@ def _req_with_backoff(url, params, max_tries=8):
             try:
                 last_text = r.text[:600]
             except Exception:
-                last_text = "<no text>"
+                last_text = ""
 
             if r.status_code in (429, 500, 502, 503, 504):
                 retry_after = None
@@ -364,7 +474,6 @@ def _req_with_backoff(url, params, max_tries=8):
                 sleep_s = delay
                 if retry_after is not None and retry_after > sleep_s:
                     sleep_s = retry_after
-
                 print(f"[WARN] HTTP {r.status_code} attempt {i}/{max_tries}. sleep {sleep_s:.1f}s")
                 _time.sleep(sleep_s)
                 delay = min(120, delay * backoff)
@@ -379,12 +488,12 @@ def _req_with_backoff(url, params, max_tries=8):
             delay = min(120, delay * backoff)
 
     raise RuntimeError(
-        "Request failed after retries. "
+        "Request failed after retries.\n"
         f"Last status={last_status}, last_response={last_text}, last_exception={repr(last_exc)}"
     )
 
 
-# ------------------------------ weather (daily, origin only) ------------------------------
+# ------------------------------ weather (daily) ------------------------------
 
 DAILY_WEATHER_VARS = [
     "temperature_2m_max",
@@ -414,7 +523,6 @@ def _fetch_daily_weather(lat, lon, start, end, tz):
     if not daily or "time" not in daily:
         cols = ["time"] + DAILY_WEATHER_VARS
         return pd.DataFrame(columns=cols).assign(FlightDate=pd.to_datetime([])).drop(columns=["time"])
-
     w = pd.DataFrame(daily)
     w["FlightDate"] = pd.to_datetime(w["time"])
     return w.drop(columns=["time"])
@@ -437,7 +545,6 @@ def add_origin_weather_daily(df, airports_meta: Dict[str, Tuple[float, float, st
         lat, lon, tz = airports_meta[ap]
         safe_tz = tz.replace("/", "__")
         cache_path = cache_dir / f"{ap}_{start}_{end}_{safe_tz}_daily.parquet"
-
         if cache_path.exists():
             wx = pd.read_parquet(cache_path)
         else:
@@ -452,11 +559,48 @@ def add_origin_weather_daily(df, airports_meta: Dict[str, Tuple[float, float, st
     if frames:
         o = pd.concat(frames, ignore_index=True)
         df = df.merge(o, on=["FlightDate", "Origin"], how="left")
-
     return df
 
 
-# ------------------------------ weather (hourly at dep time, origin only) ------------------------------
+def add_dest_weather_daily(df, airports_meta: Dict[str, Tuple[float, float, str]], cache_dir: str):
+    """
+    Adds daily weather for DESTINATION airport, keyed on (FlightDate, Dest).
+    Uses Open-Meteo ARCHIVE (actual weather). Columns prefixed with dest_*
+    """
+    df = df.copy()
+    df["FlightDate"] = pd.to_datetime(df["FlightDate"], errors="coerce")
+
+    cache_dir = _abspath(cache_dir, base="data")
+    cache_dir.mkdir(parents=True, exist_ok=True)
+
+    start = df["FlightDate"].min().strftime("%Y-%m-%d")
+    end = df["FlightDate"].max().strftime("%Y-%m-%d")
+
+    needed = sorted(pd.unique(df["Dest"].astype(str).str.upper()))
+    frames = []
+
+    for ap in needed:
+        lat, lon, tz = airports_meta[ap]
+        safe_tz = tz.replace("/", "__")
+        cache_path = cache_dir / f"{ap}_{start}_{end}_{safe_tz}_daily.parquet"
+        if cache_path.exists():
+            wx = pd.read_parquet(cache_path)
+        else:
+            wx = _fetch_daily_weather(lat, lon, start, end, tz)
+            wx.to_parquet(cache_path, index=False)
+
+        dw = wx.copy()
+        dw["Dest"] = ap
+        dw = dw.rename(columns={c: f"dest_{c}" for c in DAILY_WEATHER_VARS})
+        frames.append(dw[["FlightDate", "Dest"] + [f"dest_{c}" for c in DAILY_WEATHER_VARS]])
+
+    if frames:
+        d = pd.concat(frames, ignore_index=True)
+        df = df.merge(d, on=["FlightDate", "Dest"], how="left")
+    return df
+
+
+# ------------------------------ weather (hourly at dep time + hourly at arr time) ------------------------------
 
 HOURLY_WEATHER_VARS = [
     "temperature_2m",
@@ -465,7 +609,8 @@ HOURLY_WEATHER_VARS = [
     "weathercode",
 ]
 
-def _fetch_hourly_weather(lat, lon, start, end, tz):
+
+def _fetch_hourly_weather(lat, lon, start, end, tz, *, prefix: str):
     url = "https://archive-api.open-meteo.com/v1/archive"
     r = _req_with_backoff(
         url,
@@ -481,7 +626,7 @@ def _fetch_hourly_weather(lat, lon, start, end, tz):
     payload = r.json()
     hourly = payload.get("hourly")
     if not hourly or "time" not in hourly:
-        cols = ["hour_utc"] + [f"origin_dep_{v}" for v in HOURLY_WEATHER_VARS]
+        cols = ["hour_utc"] + [f"{prefix}{v}" for v in HOURLY_WEATHER_VARS]
         return pd.DataFrame(columns=cols)
 
     h = pd.DataFrame(hourly)
@@ -493,7 +638,7 @@ def _fetch_hourly_weather(lat, lon, start, end, tz):
 
     out = pd.DataFrame({"hour_utc": hour_utc})
     for v in HOURLY_WEATHER_VARS:
-        out[f"origin_dep_{v}"] = pd.to_numeric(h.loc[t_local.index].get(v), errors="coerce")
+        out[f"{prefix}{v}"] = pd.to_numeric(h.loc[t_local.index].get(v), errors="coerce")
 
     return out.dropna(subset=["hour_utc"]).drop_duplicates(subset=["hour_utc"]).reset_index(drop=True)
 
@@ -501,7 +646,6 @@ def _fetch_hourly_weather(lat, lon, start, end, tz):
 def add_origin_weather_hourly_at_dep(df, airports_meta: Dict[str, Tuple[float, float, str]], cache_dir: str):
     df = df.copy()
     df["FlightDate"] = pd.to_datetime(df["FlightDate"], errors="coerce")
-
     if "dep_dt_local" not in df.columns:
         raise KeyError("add_origin_weather_hourly_at_dep requires dep_dt_local column (run add_timezone_local_times first).")
 
@@ -522,11 +666,10 @@ def add_origin_weather_hourly_at_dep(df, airports_meta: Dict[str, Tuple[float, f
         safe_tz = tz.replace("/", "__")
         cache_path = cache_dir / f"{ap}_{start}_{end}_{safe_tz}_hourly.parquet"
 
-        wx = None
         if cache_path.exists():
             wx = pd.read_parquet(cache_path)
         else:
-            wx = _fetch_hourly_weather(lat, lon, start, end, tz)
+            wx = _fetch_hourly_weather(lat, lon, start, end, tz, prefix="origin_dep_")
             if wx is not None and not wx.empty and "hour_utc" in wx.columns:
                 wx.to_parquet(cache_path, index=False)
 
@@ -541,7 +684,6 @@ def add_origin_weather_hourly_at_dep(df, airports_meta: Dict[str, Tuple[float, f
         h = pd.concat(frames, ignore_index=True)
         h["hour_utc"] = pd.to_datetime(h["hour_utc"], errors="coerce")
         df["_dep_hour_utc"] = pd.to_datetime(df["_dep_hour_utc"], errors="coerce")
-
         df = df.merge(
             h.rename(columns={"hour_utc": "_dep_hour_utc"}),
             on=["Origin", "_dep_hour_utc"],
@@ -549,6 +691,61 @@ def add_origin_weather_hourly_at_dep(df, airports_meta: Dict[str, Tuple[float, f
         )
 
     df = df.drop(columns=["_dep_hour_utc"], errors="ignore")
+    return df
+
+
+def add_dest_weather_hourly_at_arr(df, airports_meta: Dict[str, Tuple[float, float, str]], cache_dir: str):
+    """
+    Adds destination hourly weather at *scheduled arrival time* (arr_dt_local).
+    Uses Open-Meteo ARCHIVE (actual weather).
+    """
+    df = df.copy()
+    df["FlightDate"] = pd.to_datetime(df["FlightDate"], errors="coerce")
+    if "arr_dt_local" not in df.columns:
+        raise KeyError("add_dest_weather_hourly_at_arr requires arr_dt_local column (run add_timezone_local_times first).")
+
+    arr_utc = pd.to_datetime(df["arr_dt_local"], errors="coerce", utc=True)
+    df["_arr_hour_utc"] = arr_utc.dt.floor("h").dt.tz_localize(None)
+
+    cache_dir = _abspath(cache_dir, base="data")
+    cache_dir.mkdir(parents=True, exist_ok=True)
+
+    start = df["FlightDate"].min().strftime("%Y-%m-%d")
+    end = df["FlightDate"].max().strftime("%Y-%m-%d")
+
+    needed = sorted(pd.unique(df["Dest"].astype(str).str.upper()))
+    frames = []
+
+    for ap in needed:
+        lat, lon, tz = airports_meta[ap]
+        safe_tz = tz.replace("/", "__")
+        cache_path = cache_dir / f"{ap}_{start}_{end}_{safe_tz}_hourly.parquet"
+
+        if cache_path.exists():
+            wx = pd.read_parquet(cache_path)
+        else:
+            wx = _fetch_hourly_weather(lat, lon, start, end, tz, prefix="dest_arr_")
+            if wx is not None and not wx.empty and "hour_utc" in wx.columns:
+                wx.to_parquet(cache_path, index=False)
+
+        if wx is None or wx.empty:
+            continue
+
+        dw = wx.copy()
+        dw["Dest"] = ap
+        frames.append(dw)
+
+    if frames:
+        h = pd.concat(frames, ignore_index=True)
+        h["hour_utc"] = pd.to_datetime(h["hour_utc"], errors="coerce")
+        df["_arr_hour_utc"] = pd.to_datetime(df["_arr_hour_utc"], errors="coerce")
+        df = df.merge(
+            h.rename(columns={"hour_utc": "_arr_hour_utc"}),
+            on=["Dest", "_arr_hour_utc"],
+            how="left",
+        )
+
+    df = df.drop(columns=["_arr_hour_utc"], errors="ignore")
     return df
 
 
@@ -564,8 +761,8 @@ def add_aircraft_age(df: pd.DataFrame, reg_csv: str) -> pd.DataFrame:
 
     reg = pd.read_csv(reg_path, dtype={"Tail_Number": str, "Year_Mfr": float})
     df = df.merge(reg, on="Tail_Number", how="left")
-    df["FlightDate"] = pd.to_datetime(df["FlightDate"], errors="coerce")
 
+    df["FlightDate"] = pd.to_datetime(df["FlightDate"], errors="coerce")
     mask = df["Year_Mfr"].notna() & df["FlightDate"].notna()
     df.loc[mask, "Aircraft_Age_Years"] = df.loc[mask, "FlightDate"].dt.year - df.loc[mask, "Year_Mfr"]
 
@@ -586,16 +783,6 @@ def add_aircraft_age(df: pd.DataFrame, reg_csv: str) -> pd.DataFrame:
 
 
 # ------------------------------ FAA aircraft type (from MASTER + ACFTREF) ------------------------------
-
-def _normalize_tail_number_series(s: pd.Series) -> pd.Series:
-    x = s.astype("string").fillna("")
-    x = x.str.upper().str.strip()
-    x = x.str.replace(r"[^A-Z0-9]", "", regex=True)
-
-    needs_n = (~x.str.startswith("N")) & (x.str.len() > 0)
-    x = x.where(~needs_n, "N" + x)
-    return x
-
 
 def _clean_faa_colname(c: str) -> str:
     if c is None:
@@ -621,11 +808,9 @@ def _read_faa_two_cols_csv(path: Path, col_a: str, col_b: str) -> pd.DataFrame:
             strict=False,
             skipinitialspace=True,
         )
-
         header = next(reader, None)
         if header is None:
             raise RuntimeError(f"Empty FAA table: {path}")
-
         header = [_clean_faa_colname(h) for h in header]
         while header and header[-1] == "":
             header.pop()
@@ -633,20 +818,16 @@ def _read_faa_two_cols_csv(path: Path, col_a: str, col_b: str) -> pd.DataFrame:
         try:
             ia = header.index(col_a)
         except ValueError:
-            header2 = [_clean_faa_colname(h) for h in header]
-            ia = header2.index(col_a)
+            ia = [_clean_faa_colname(h) for h in header].index(col_a)
 
         try:
             ib = header.index(col_b)
         except ValueError:
-            header2 = [_clean_faa_colname(h) for h in header]
-            ib = header2.index(col_b)
+            ib = [_clean_faa_colname(h) for h in header].index(col_b)
 
         ncols = len(header)
-
         out_a = []
         out_b = []
-
         for row in reader:
             if not row:
                 continue
@@ -654,18 +835,15 @@ def _read_faa_two_cols_csv(path: Path, col_a: str, col_b: str) -> pd.DataFrame:
                 row = row + [""] * (ncols - len(row))
             elif len(row) > ncols:
                 row = row[:ncols]
-
-            va = row[ia].strip()
-            vb = row[ib].strip()
-            out_a.append(va)
-            out_b.append(vb)
-
-    return pd.DataFrame({col_a: out_a, col_b: out_b})
+            out_a.append(row[ia].strip())
+            out_b.append(row[ib].strip())
+        return pd.DataFrame({col_a: out_a, col_b: out_b})
 
 
 def _read_faa_acftref_lookup(path: Path) -> pd.DataFrame:
-    df = _read_faa_two_cols_csv(path, "CODE", "MFR")
+    _ = _read_faa_two_cols_csv(path, "CODE", "MFR")  # quick header sanity
     path = Path(path)
+
     with open(path, "r", encoding="utf-8-sig", errors="replace", newline="") as f:
         reader = csv.reader(
             f,
@@ -682,12 +860,14 @@ def _read_faa_acftref_lookup(path: Path) -> pd.DataFrame:
         header = [_clean_faa_colname(h) for h in header]
         while header and header[-1] == "":
             header.pop()
+
         need = ["CODE", "MFR", "MODEL"]
         idx = {}
         for k in need:
             if k not in header:
                 raise RuntimeError(f"FAA acftref missing column {k}. Got={header[:20]}")
             idx[k] = header.index(k)
+
         ncols = len(header)
         rows = []
         for row in reader:
@@ -698,8 +878,8 @@ def _read_faa_acftref_lookup(path: Path) -> pd.DataFrame:
             elif len(row) > ncols:
                 row = row[:ncols]
             rows.append((row[idx["CODE"]].strip(), row[idx["MFR"]].strip(), row[idx["MODEL"]].strip()))
-    out = pd.DataFrame(rows, columns=["CODE", "MFR", "MODEL"])
-    return out
+
+        return pd.DataFrame(rows, columns=["CODE", "MFR", "MODEL"])
 
 
 def _normalize_tail_to_nnumber(tail: str) -> str:
@@ -729,8 +909,7 @@ def add_aircraft_type_from_faa_registry(df: pd.DataFrame, cfg: dict) -> pd.DataF
         df["aircraft_type"] = df.get("aircraft_type", "Unknown")
         return df
 
-    master_small = _read_faa_two_cols_csv(master_p, "N-NUMBER", "MFR MDL CODE")
-    master_small = master_small.rename(columns={"MFR MDL CODE": "faa_mfr_mdl_code"})
+    master_small = _read_faa_two_cols_csv(master_p, "N-NUMBER", "MFR MDL CODE").rename(columns={"MFR MDL CODE": "faa_mfr_mdl_code"})
     master_small["N-NUMBER"] = master_small["N-NUMBER"].astype(str).str.strip()
     master_small["faa_mfr_mdl_code"] = master_small["faa_mfr_mdl_code"].astype(str).str.strip()
 
@@ -754,7 +933,6 @@ def add_aircraft_type_from_faa_registry(df: pd.DataFrame, cfg: dict) -> pd.DataF
     unk = (df["aircraft_type"] == "Unknown").mean() * 100.0
     ok = 100.0 - unk
     print(f"[INFO] FAA aircraft_type match_rate={ok:.3f}% (Unknown={unk:.3f}%)")
-
     return df
 
 
@@ -766,11 +944,13 @@ def build_and_write_history_pool(cfg: dict) -> Optional[Path]:
 
     This pool must contain enough columns to compute rolling features later:
       - FlightDate
-      - DepDelayMinutes
-      - Origin
-      - Reporting_Airline
-      - Flight_Number_Reporting_Airline
-      - CRSDepTime + dep_dt_local for stable ordering (and congestion)
+      - DepDelayMinutes / DepDel15
+      - ArrDelayMinutes (arrival targets / stats)
+      - Origin / Dest
+      - Reporting_Airline / Flight_Number_Reporting_Airline
+      - CRSDepTime + dep_dt_local (+ dep_local_date) (dep congestion features)
+      - CRSArrTime + arr_dt_local (+ arr_local_date) (arrival congestion features)
+      - AirTime, WheelsOff/WheelsOn, TaxiOut/TaxiIn (arrival subcomponents)
     """
     hist_paths = cfg.get("history_flights_path") or cfg.get("input_flights_path")
     if not hist_paths:
@@ -783,11 +963,26 @@ def build_and_write_history_pool(cfg: dict) -> Optional[Path]:
 
     lookback_days = int(cfg.get("history_lookback_days", 60))
 
-    hist = read_input_parquet(hist_paths)
+    airports = _load_airport_filter_set(cfg)
+    hist = read_input_parquet(hist_paths, cfg=cfg, airports_set=airports)
     hist = canonicalize_bts_columns(hist)
-
     hist["FlightDate"] = pd.to_datetime(hist["FlightDate"], errors="coerce")
-    for c in ["CRSDepTime", "DepDelayMinutes", "DepDel15", "Flight_Number_Reporting_Airline"]:
+
+    # numeric normalization
+    for c in [
+        "CRSDepTime",
+        "CRSArrTime",
+        "DepDelayMinutes",
+        "ArrDelayMinutes",
+        "DepDel15",
+        "ArrDel15",
+        "Flight_Number_Reporting_Airline",
+        "AirTime",
+        "WheelsOff",
+        "WheelsOn",
+        "TaxiOut",
+        "TaxiIn",
+    ]:
         if c in hist.columns:
             hist[c] = pd.to_numeric(hist[c], errors="coerce")
 
@@ -797,6 +992,7 @@ def build_and_write_history_pool(cfg: dict) -> Optional[Path]:
         hist["Dest"] = hist["Dest"].astype(str).str.upper()
         hist = hist[hist["Origin"].isin(airports) & hist["Dest"].isin(airports)]
 
+    # date-window
     if cfg.get("start_date") and cfg.get("end_date"):
         s = _parse_date_strict(cfg["start_date"], "start_date") - pd.Timedelta(days=lookback_days)
         e = _parse_date_strict(cfg["end_date"], "end_date")
@@ -811,13 +1007,16 @@ def build_and_write_history_pool(cfg: dict) -> Optional[Path]:
     airports_csv_resolved = _abspath(airports_csv, base="repo")
     meta_df = load_airport_meta(airports_csv)
 
-    needed_origins = sorted(pd.unique(hist["Origin"].astype(str).str.upper()))
+    # IMPORTANT: history pool needs tz for both origins and dests if we compute arr_dt_local too
+    needed_iata = sorted(pd.unique(pd.concat([hist["Origin"], hist["Dest"]]).astype(str).str.upper()))
     airports_meta = _validate_tz_strings_for_needed(
         meta_df,
-        needed_origins,
+        needed_iata,
         airports_csv_for_msg=airports_csv_resolved,
     )
+
     hist = _add_dep_dt_local_for_history_pool(hist, airports_meta)
+    hist = _add_arr_dt_local_for_history_pool(hist, airports_meta)
 
     keep = [
         "FlightDate",
@@ -827,9 +1026,18 @@ def build_and_write_history_pool(cfg: dict) -> Optional[Path]:
         "Flight_Number_Reporting_Airline",
         "DepDelayMinutes",
         "DepDel15",
+        "ArrDelayMinutes",
         "CRSDepTime",
+        "CRSArrTime",
         "dep_dt_local",
         "dep_local_date",
+        "arr_dt_local",
+        "arr_local_date",
+        "AirTime",
+        "WheelsOff",
+        "WheelsOn",
+        "TaxiOut",
+        "TaxiIn",
     ]
     keep = [c for c in keep if c in hist.columns]
     hist = hist[keep].copy()
@@ -857,9 +1065,10 @@ def main():
     airports_csv = cfg.get("airports_csv", "data/meta/airports.csv")
     airports_csv_resolved = _abspath(airports_csv, base="repo")
     meta_df = load_airport_meta(airports_csv)
-    print(f"[INFO] airports_csv -> {airports_csv_resolved}  (exists={airports_csv_resolved.exists()})")
+    print(f"[INFO] airports_csv -> {airports_csv_resolved} (exists={airports_csv_resolved.exists()})")
 
-    df = read_input_parquet(cfg["input_flights_path"])
+    airports = _load_airport_filter_set(cfg)
+    df = read_input_parquet(cfg["input_flights_path"], cfg=cfg, airports_set=airports)
     df = canonicalize_bts_columns(df)
 
     df["FlightDate"] = pd.to_datetime(df["FlightDate"], errors="coerce")
@@ -905,18 +1114,32 @@ def main():
         df = add_aircraft_age(df, reg_csv=cfg.get("aircraft_registry_csv", "data/aircraft_registry_clean.csv"))
 
     weather_cfg = cfg.get("weather") or {}
+
+    # origin daily
     if bool(weather_cfg.get("daily", True)):
         cache_dir = weather_cfg.get("cache_dir", "weather_cache")
         df = add_origin_weather_daily(df, airports_meta=airports_meta, cache_dir=cache_dir)
 
+        # dest daily
+        if bool(weather_cfg.get("dest_daily", True)):
+            dest_cache_dir = weather_cfg.get("dest_cache_dir", cache_dir)
+            df = add_dest_weather_daily(df, airports_meta=airports_meta, cache_dir=dest_cache_dir)
+
+    # origin hourly @ dep
     if bool(weather_cfg.get("hourly_at_dep", True)):
         hourly_cache_dir = weather_cfg.get("hourly_cache_dir", "weather_cache_hourly")
         df = add_origin_weather_hourly_at_dep(df, airports_meta=airports_meta, cache_dir=hourly_cache_dir)
+
+        # dest hourly @ scheduled arr
+        if bool(weather_cfg.get("dest_hourly_at_arr", True)):
+            dest_hourly_cache_dir = weather_cfg.get("dest_hourly_cache_dir", hourly_cache_dir)
+            df = add_dest_weather_hourly_at_arr(df, airports_meta=airports_meta, cache_dir=dest_hourly_cache_dir)
 
     out_enriched = cfg.get("output_enriched_unbalanced_path", "intermediate/enriched_{target}_unbalanced.parquet")
     out_enriched = _format_path_template(out_enriched, target=target)
     out_path = _abspath(out_enriched, base="data")
     out_path.parent.mkdir(parents=True, exist_ok=True)
+
     df.to_parquet(out_path, index=False)
     print(f"[OK] wrote enriched unbalanced rows={len(df)} -> {out_path}")
 
