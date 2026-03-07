@@ -2,18 +2,18 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from datetime import date
+from datetime import date, datetime, timezone
 from functools import lru_cache
 from pathlib import Path
 from threading import Lock
 from typing import Any, Dict, Optional, Tuple
 
-# Reuse the battle-tested CLI building blocks for v0
 from flightright.cli import predict as cli
+from flightright.service.airline_verify import verify_flight_on_airline_site
 
 
 # ----------------------------
-# Config models (unchanged)
+# Config models
 # ----------------------------
 @dataclass(frozen=True)
 class RemoteModelConfig:
@@ -92,8 +92,6 @@ def _infer_airline_iata(airline: str) -> str:
 # ----------------------------
 # Caching: airports + model store + model load
 # ----------------------------
-
-# Avoid duplicate model loads under concurrency
 _MODEL_LOAD_LOCK = Lock()
 
 
@@ -101,7 +99,7 @@ _MODEL_LOAD_LOCK = Lock()
 def _load_airports_cached(airports_csv_path: str) -> Dict[str, cli.AirportInfo]:
     """
     Cache airports.csv parsed contents in-memory.
-    Keyed by path string (good enough since on Fly it's stable: /data/meta/airports.csv).
+    Keyed by path string.
     """
     return cli.load_airports_csv(Path(airports_csv_path))
 
@@ -115,7 +113,7 @@ def _get_s3_store_cached(
     endpoint_url: Optional[str],
 ) -> cli.S3ModelStore:
     """
-    Cache the S3ModelStore object (and its boto3 internals) per (bucket/prefix/cache_dir/endpoint).
+    Cache the S3ModelStore object per (bucket/prefix/cache_dir/endpoint).
     """
     return cli.S3ModelStore(
         bucket=bucket,
@@ -127,7 +125,7 @@ def _get_s3_store_cached(
 
 def _load_joblib_with_mmap(model_path: Path) -> Any:
     """
-    Prefer mmap_mode="r" for joblib artifacts to reduce RSS growth when possible.
+    Prefer mmap_mode='r' for joblib artifacts to reduce RSS growth when possible.
     Falls back to normal load if unsupported.
     """
     if not model_path.exists():
@@ -140,10 +138,8 @@ def _load_joblib_with_mmap(model_path: Path) -> Any:
         try:
             return joblib.load(model_path, mmap_mode="r")
         except TypeError:
-            # older joblib signature
             return joblib.load(model_path)
         except Exception:
-            # if mmap fails for this artifact, still try regular load
             return joblib.load(model_path)
 
     if suffix in (".pkl", ".pickle"):
@@ -169,11 +165,16 @@ def _get_model_cached(
     histflag: str,
 ) -> Tuple[Any, str, str]:
     """
-    Download + load the model ONCE per resolved model spec, then reuse across requests.
+    Download + load the model once per resolved model spec, then reuse across requests.
 
     Returns: (model_object, remote_dir_prefix, model_path_str)
     """
-    store = _get_s3_store_cached(bucket=bucket, prefix=prefix, cache_dir=cache_dir, endpoint_url=endpoint_url)
+    store = _get_s3_store_cached(
+        bucket=bucket,
+        prefix=prefix,
+        cache_dir=cache_dir,
+        endpoint_url=endpoint_url,
+    )
 
     spec = cli.RemoteModelSpec(
         airline=airline,
@@ -186,7 +187,6 @@ def _get_model_cached(
     remote_dir_prefix = store.find_remote_model_dir_prefix(spec)
     model_path = store.download_deploy_joblib(remote_dir_prefix)
 
-    # Thread-safe: ensure only one thread loads it at a time (prevents double-load spikes).
     with _MODEL_LOAD_LOCK:
         model = _load_joblib_with_mmap(model_path)
 
@@ -202,7 +202,7 @@ def _safe_model_id(
     histflag: str,
 ) -> str:
     """
-    Stable identifier for clients/logs that does NOT leak bucket names or on-disk paths.
+    Stable identifier for clients/logs that does not leak bucket names or on-disk paths.
     Mirrors cli.RemoteModelSpec.dir_name.
     """
     return f"{airline}_{int(n_airports)}_{years}_{weatherflag}_{histflag}"
@@ -228,7 +228,7 @@ def predict_departure(
 ) -> Dict[str, Any]:
     """
     public_mode:
-      - True  (default): safe for untrusted clients; do NOT leak S3 bucket/prefix or /data paths.
+      - True: safe for untrusted clients; do not leak S3 bucket/prefix or /data paths.
       - False: admin/debug; include internal model_locator + remote_dir_prefix.
     """
     airline_iata = _infer_airline_iata(airline)
@@ -244,17 +244,70 @@ def predict_departure(
     # Load airport metadata (cached)
     airports_csv_path = str(Path(cfg.data_paths.airports_csv))
     airports = _load_airports_cached(airports_csv_path)
+
     if req.origin.upper() not in airports:
         raise ValueError(f"Origin airport {req.origin} not found in airports.csv")
+    if req.dest.upper() not in airports:
+        raise ValueError(f"Destination airport {req.dest} not found in airports.csv")
+
     origin_info = airports[req.origin.upper()]
+    dest_info = airports[req.dest.upper()]  # kept in case needed later
+
+    # Build airport -> timezone map from airports.csv metadata
+    # cli.load_airports_csv stores the CSV Timezone column on AirportInfo.tz
+    airport_timezones: Dict[str, str] = {
+        code.upper(): info.tz
+        for code, info in airports.items()
+        if getattr(info, "tz", None)
+    }
 
     fl = cli.FlightLabsClient(access_key=cfg.flightlabs_access_key)
 
-    # 1) Verify flight exists + scheduled departure (UTC)
+    # 1) Future flights payload for origin/day
     future = fl.future_flights_departures(req.origin.upper(), req.flight_date)
-    _flight_row, sched_dep_utc = cli._match_future_flight(future, req)
 
-    # 2) Congestion
+    # 2) Verify flight existence + scheduled departure
+    _flight_row = None
+    sched_dep_utc = None
+    verification_source = "future_flights"
+    airline_site_verification = None
+    future_match_error = None
+
+    try:
+        _flight_row, sched_dep_utc = cli._match_future_flight(future, req)
+    except Exception as e:
+        future_match_error = str(e)
+
+        airline_site_verification = verify_flight_on_airline_site(
+            airline_iata=req.airline_iata,
+            flight_number=req.flight_number,
+            origin=req.origin.upper(),
+            dest=req.dest.upper(),
+            dep_date=req.flight_date,
+            airport_timezones=airport_timezones,
+        )
+
+        if not airline_site_verification.exists:
+            raise RuntimeError(
+                f"Could not verify flight {req.airline_iata}{req.flight_number} "
+                f"{req.origin}->{req.dest} on {req.flight_date}. "
+                f"Future flights error: {future_match_error}. "
+                f"Airline verifier notes: {airline_site_verification.notes}"
+            )
+
+        if not airline_site_verification.scheduled_departure_utc:
+            raise RuntimeError(
+                f"Flight {req.airline_iata}{req.flight_number} was found on the airline site, "
+                f"but no scheduled departure UTC could be extracted. "
+                f"Airline verifier notes: {airline_site_verification.notes}"
+            )
+
+        sched_dep_utc = datetime.fromisoformat(
+            airline_site_verification.scheduled_departure_utc.replace("Z", "+00:00")
+        ).astimezone(timezone.utc)
+        verification_source = "airline_site"
+
+    # 3) Congestion from future endpoint around the verified time
     cong_total, cong_airline = cli.compute_congestion_3h(
         future_payload=future,
         target_sched_dep_utc=sched_dep_utc,
@@ -262,15 +315,19 @@ def predict_departure(
         flight_number=req.flight_number,
     )
 
-    # 3) Weather
-    daily_w = cli.openmeteo_daily(origin_info.lat, origin_info.lon, req.flight_date) if include_weather else None
+    # 4) Weather
+    daily_w = (
+        cli.openmeteo_daily(origin_info.lat, origin_info.lon, req.flight_date)
+        if include_weather
+        else None
+    )
     hourly_w = (
         cli.openmeteo_hourly_near_departure(origin_info.lat, origin_info.lon, sched_dep_utc)
         if include_weather
         else None
     )
 
-    # 4) Flight-number history
+    # 5) Flight-number history
     flight_hist = (
         cli.compute_flightnum_od_rolling_stats_last28d(
             client=fl,
@@ -284,7 +341,7 @@ def predict_departure(
         else {}
     )
 
-    # 5) Airport/airline caches (not implemented yet)
+    # 6) Airport/airline caches (not implemented yet)
     airport_carrier_cache = None
 
     av = cli.assess_availability(daily_w, hourly_w, airport_carrier_cache)
@@ -348,7 +405,6 @@ def predict_departure(
     if isinstance(sev_score, (int, float)):
         pred["severity_band"] = _default_severity_band(float(sev_score))
 
-    # SAFE identifier (no S3, no /data paths)
     model_id = _safe_model_id(
         airline=req.airline_iata.upper(),
         n_airports=int(n_airports),
@@ -382,6 +438,7 @@ def predict_departure(
             "flight_number": f"{req.airline_iata.upper()}{req.flight_number}",
             "flight_date": req.flight_date.isoformat(),
             "scheduled_departure_utc": sched_dep_utc.isoformat(),
+            "verification_source": verification_source,
         },
         "prediction": pred,
         "tabs": {
@@ -392,7 +449,23 @@ def predict_departure(
         },
     }
 
-    # Admin/debug-only internals
+    if airline_site_verification is not None:
+        out["verification"] = {
+            "source": "airline_site",
+            "exists": airline_site_verification.exists,
+            "scheduled_departure_local": airline_site_verification.scheduled_departure_local,
+            "scheduled_arrival_local": airline_site_verification.scheduled_arrival_local,
+            "scheduled_departure_utc": airline_site_verification.scheduled_departure_utc,
+            "scheduled_arrival_utc": airline_site_verification.scheduled_arrival_utc,
+            "notes": airline_site_verification.notes,
+        }
+    elif future_match_error:
+        out["verification"] = {
+            "source": "future_flights",
+            "exists": True,
+            "notes": [future_match_error],
+        }
+
     if not public_mode:
         out["model_locator"] = model_path_str
         out["remote_dir_prefix"] = remote_dir_prefix
