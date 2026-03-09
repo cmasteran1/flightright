@@ -471,6 +471,29 @@
               </div>
             </div>
 
+            <div id="scheduleFallbackBox" style="display:none; margin-top:14px;">
+              <div
+                id="scheduleFallbackWarning"
+                class="footnote"
+                style="margin-bottom:10px; color:rgba(247,201,72,.98); font-weight:700;"
+              >
+                Warning: this flight was not found automatically, but it may still exist.
+                Enter the scheduled local departure and arrival times from your itinerary to continue.
+              </div>
+
+              <div class="formGrid">
+                <div>
+                  <label for="schedDepTime">Scheduled departure (local)</label>
+                  <input id="schedDepTime" type="time" step="60" />
+                </div>
+
+                <div>
+                  <label for="schedArrTime">Scheduled arrival (local)</label>
+                  <input id="schedArrTime" type="time" step="60" />
+                </div>
+              </div>
+            </div>
+
             <button id="goBtn" class="btn">Get delay risk</button>
             <div class="tip">Tip: Try tomorrow’s date for the most stable results.</div>
             <div id="formError" class="footnote" style="display:none;color:rgba(255,77,109,.95);font-weight:700;"></div>
@@ -521,6 +544,12 @@
         return Math.max(0, Math.min(1, n));
       }
 
+      function normalizeSeverity(x){
+        const n = Number(x);
+        if (!Number.isFinite(n)) return null;
+        return Math.max(0, Math.min(4, n)) / 4;
+      }
+
       function fmtPct(p){
         const n = clamp01(p);
         return (Math.round(n * 1000) / 10).toFixed(1) + "%";
@@ -536,19 +565,39 @@
         const raw =
           String(
             data?.user_message ||
+            data?.detail?.user_message ||
             data?.detail ||
             data?.error ||
             fallbackMessage ||
             ""
           ).trim();
 
+        const errorCode = data?.error_code || data?.detail?.error_code || "";
+        const warning = data?.warning || data?.detail?.warning || "";
+        const userTitle = data?.user_title || data?.detail?.user_title;
+        const userMessage = data?.user_message || data?.detail?.user_message;
+        const userAction = data?.user_action || data?.detail?.user_action;
+        const needsScheduleInputs = Boolean(
+          data?.needs_schedule_inputs || data?.detail?.needs_schedule_inputs
+        );
+
         const lower = raw.toLowerCase();
 
-        if (data?.user_title || data?.user_message || data?.user_action) {
+        if (errorCode === "flight_not_found_needs_schedule_times" || needsScheduleInputs) {
           return {
-            title: data.user_title || "We couldn’t run this prediction",
-            message: data.user_message || "We were not able to generate a delay estimate for this flight.",
-            action: data.user_action || "Please double-check the flight details and try again."
+            title: userTitle || "We couldn’t confirm that flight automatically",
+            message: userMessage || "We could not find this flight automatically, but it may still exist.",
+            action: userAction || "Enter the local scheduled departure and arrival times from your itinerary, then try again.",
+            warning: warning || "Flight was not found automatically, but it may still exist.",
+            needsScheduleInputs: true
+          };
+        }
+
+        if (userTitle || userMessage || userAction) {
+          return {
+            title: userTitle || "We couldn’t run this prediction",
+            message: userMessage || "We were not able to generate a delay estimate for this flight.",
+            action: userAction || "Please double-check the flight details and try again."
           };
         }
 
@@ -563,9 +612,9 @@
 
           if (lower.includes("flight not found") || lower.includes("not found")) {
             return {
-              title: "We couldn’t find that flight",
-              message: "The flight details did not match a scheduled flight for the date you entered.",
-              action: "Check the airline code, flight number, origin, destination, and date, then try again."
+              title: "We couldn’t find that flight automatically",
+              message: "The flight details did not match a scheduled flight in our automatic lookup. The flight may still exist.",
+              action: "Check the airline code, flight number, origin, destination, and date. If you know the scheduled times, enter them and try again."
             };
           }
 
@@ -587,7 +636,7 @@
         if (status === 422) {
           return {
             title: "Not enough information to make a prediction",
-            message: "We found the request, but there was not enough valid data to generate a reliable result.",
+            message: raw || "We found the request, but there was not enough valid data to generate a reliable result.",
             action: "Try a different date or check back later."
           };
         }
@@ -634,9 +683,7 @@
         return new Date(d - tz).toISOString().slice(0,10);
       }
 
-      // Weather “pictures” (inline SVG)
       function wxIconSvg(kind){
-        // kind: "clear" | "cloud" | "rain" | "storm" | "snow" | "fog" | "unknown"
         const base = `
           <svg width="28" height="28" viewBox="0 0 24 24" fill="none" aria-hidden="true">
         `;
@@ -692,7 +739,6 @@
         ` + end;
       }
 
-      // Basic WMO-ish grouping (works even if your code isn’t exactly WMO; it’s a good visual fallback)
       function wxKindFromCode(code){
         const c = Number(code);
         if (!Number.isFinite(c)) return "unknown";
@@ -705,13 +751,45 @@
         return "cloud";
       }
 
-      function bandFromScore(score){
-        // score assumed 0..1-ish; fall back safely
-        const s = clamp01(score);
-        if (s < 0.25) return { name: "Safe", cls: "bandSafe" };
-        if (s < 0.50) return { name: "Caution", cls: "bandCaution" };
-        if (s < 0.75) return { name: "Risk", cls: "bandRisk" };
+      function bandFromRisk100(score100){
+        const s = Number(score100);
+        if (!Number.isFinite(s)) return { name: "Unknown", cls: "bandCaution" };
+        if (s < 20) return { name: "Safe", cls: "bandSafe" };
+        if (s < 40) return { name: "Mild", cls: "bandCaution" };
+        if (s < 60) return { name: "Caution", cls: "bandRisk" };
         return { name: "High risk", cls: "bandHigh" };
+      }
+
+      function computeRiskScoreFromBuckets(labels, probs){
+        if (!Array.isArray(labels) || !Array.isArray(probs) || labels.length !== probs.length) {
+          return null;
+        }
+
+        const weightMap = {
+          "< 15 min": 0.00,
+          "15–30 min": 0.25,
+          "30-45 min": 0.50,
+          "30–45 min": 0.50,
+          "45-60 min": 0.75,
+          "45–60 min": 0.75,
+          "≥ 60 min": 1.00,
+          ">= 60 min": 1.00
+        };
+
+        let total = 0;
+        let probSum = 0;
+
+        for (let i = 0; i < labels.length; i++) {
+          const label = String(labels[i] ?? "").trim();
+          const p = clamp01(probs[i]);
+          const w = weightMap[label];
+          if (!Number.isFinite(w)) continue;
+          total += p * w;
+          probSum += p;
+        }
+
+        if (probSum <= 0) return null;
+        return Math.round(total * 100);
       }
 
       function normalizeIata(x){
@@ -726,7 +804,8 @@
       const state = {
         activeTab: "prediction",
         lastInput: null,
-        lastResponse: null
+        lastResponse: null,
+        needsScheduleFallback: false
       };
 
       // ---------- DOM ----------
@@ -743,6 +822,30 @@
       const destEl = document.getElementById("dest");
       const includeEl = document.getElementById("include");
       const goBtn = document.getElementById("goBtn");
+
+      const scheduleFallbackBoxEl = document.getElementById("scheduleFallbackBox");
+      const scheduleFallbackWarningEl = document.getElementById("scheduleFallbackWarning");
+      const schedDepTimeEl = document.getElementById("schedDepTime");
+      const schedArrTimeEl = document.getElementById("schedArrTime");
+
+      function setScheduleFallbackVisible(on, warningText = ""){
+        state.needsScheduleFallback = !!on;
+        scheduleFallbackBoxEl.style.display = on ? "block" : "none";
+
+        if (warningText) {
+          scheduleFallbackWarningEl.textContent = warningText;
+        } else {
+          scheduleFallbackWarningEl.textContent =
+            "Warning: this flight was not found automatically, but it may still exist. Enter the scheduled local departure and arrival times from your itinerary to continue.";
+        }
+      }
+
+      function resetScheduleFallback(){
+        state.needsScheduleFallback = false;
+        scheduleFallbackBoxEl.style.display = "none";
+        scheduleFallbackWarningEl.textContent =
+          "Warning: this flight was not found automatically, but it may still exist. Enter the scheduled local departure and arrival times from your itinerary to continue.";
+      }
 
       // default date = tomorrow
       dateEl.value = addDaysISO(1);
@@ -792,9 +895,21 @@
         if (!origin || origin.length !== 3) return { error: "Origin must be a 3-letter IATA code." };
         if (!dest || dest.length !== 3) return { error: "Destination must be a 3-letter IATA code." };
 
+        const sched_dep_time_24h = String(schedDepTimeEl.value || "").trim();
+        const sched_arr_time_24h = String(schedArrTimeEl.value || "").trim();
+
+        if (state.needsScheduleFallback) {
+          if (!sched_dep_time_24h) {
+            return { error: "Scheduled departure time is required because the flight was not found automatically." };
+          }
+          if (!sched_arr_time_24h) {
+            return { error: "Scheduled arrival time is required because the flight was not found automatically." };
+          }
+        }
+
         const includeMode = includeEl.value;
         const include = (includeMode === "minimal")
-          ? { } // nothing extra
+          ? {}
           : {
               weather: true,
               flight_history: true,
@@ -802,7 +917,7 @@
               airline_stats: true
             };
 
-        return {
+        const payload = {
           airline,
           flightnum,
           date,
@@ -810,6 +925,11 @@
           dest,
           include
         };
+
+        if (sched_dep_time_24h) payload.sched_dep_time_24h = sched_dep_time_24h;
+        if (sched_arr_time_24h) payload.sched_arr_time_24h = sched_arr_time_24h;
+
+        return payload;
       }
 
       async function runPredict(){
@@ -835,7 +955,7 @@
           });
           const txt = await r.text();
           let data = null;
-          try { data = JSON.parse(txt); } catch { /* ignore */ }
+          try { data = JSON.parse(txt); } catch { }
 
           if (!r.ok){
             throw normalizePredictError(
@@ -846,7 +966,8 @@
           }
 
           state.lastResponse = data;
-          // Default to prediction tab on new result
+          resetScheduleFallback();
+
           state.activeTab = "prediction";
           document.querySelectorAll(".tab").forEach(t => {
             const on = (t.dataset.tab === "prediction");
@@ -857,6 +978,13 @@
           render();
         }catch(e){
           state.lastResponse = null;
+
+          if (e?.needsScheduleInputs) {
+            setScheduleFallbackVisible(true, e.warning || e.message || "");
+            formError.textContent = e.warning || "Flight was not found automatically, but it may still exist.";
+            formError.style.display = "block";
+          }
+
           content.innerHTML = renderPredictError(e);
         }finally{
           goBtn.disabled = false;
@@ -883,23 +1011,26 @@
       }
 
       function renderPrediction(resp){
-        // Try a few shapes, since your API may evolve:
         const p = resp.prediction || resp;
 
         const severityScore = p.severity_score ?? p.severity ?? p.risk_score ?? null;
-        const band = bandFromScore(severityScore ?? 0);
-
         const expected = roundMinutes(p.expected_delay_minutes ?? p.expected_delay ?? p.expected_minutes);
         const predictedBin = p.predicted_bin ?? p.predicted_label ?? null;
 
         const labels = p.bin_labels ?? p.labels ?? null;
         const probs = p.bin_proba ?? p.bin_probs ?? p.probs ?? null;
-
         const thresholds = p.thresholds ?? p.bins ?? null;
 
-        const scoreDisplay = (severityScore === null || severityScore === undefined)
-          ? "—"
-          : String(Math.round(clamp01(severityScore) * 100));
+        const bucketRiskScore = computeRiskScoreFromBuckets(labels, probs);
+        const sevNorm = normalizeSeverity(severityScore);
+
+        const scoreDisplay = (bucketRiskScore !== null)
+          ? String(bucketRiskScore)
+          : (sevNorm === null ? "—" : String(Math.round(sevNorm * 100)));
+
+        const band = bandFromRisk100(
+          bucketRiskScore !== null ? bucketRiskScore : (sevNorm === null ? NaN : sevNorm * 100)
+        );
 
         const expectedDisplay = (expected === null) ? "—" : `${expected} min`;
         const binDisplay = predictedBin ? safeText(predictedBin) : "—";
@@ -917,7 +1048,7 @@
               <div class="riskBand ${band.cls}">
                 ${safeText(band.name)}
               </div>
-              <div class="footnote">Score is a normalized 0–100 indicator (higher = more risk).</div>
+              <div class="footnote">Score is a normalized 0–100 indicator derived from the delay bucket probabilities.</div>
             </div>
 
             <div class="kpis">
@@ -960,7 +1091,6 @@
           </div>
         `;
 
-        // Render bars
         const bars = document.getElementById("bars");
         const barList = document.createElement("div");
         barList.className = "barList";
@@ -970,10 +1100,8 @@
 
         if (!L && P && Array.isArray(p.bin_labels_fallback)) L = p.bin_labels_fallback;
 
-        // If labels missing, generate from thresholds with standard framing
         if (!L && Array.isArray(thresholds) && thresholds.length){
           const t = thresholds.map(x => roundMinutes(x)).filter(x => Number.isFinite(x));
-          // This is just a best-effort label set
           const tmp = [];
           tmp.push(`< ${t[0]} min`);
           for (let i=0;i<t.length-1;i++){
@@ -1008,185 +1136,183 @@
       }
 
       function renderWeather(resp){
-  const w = resp?.tabs?.weather ?? null;
-  if (!w){
-    content.innerHTML = `<div class="empty">No weather included in this response. Try “Include → All details”.</div>`;
-    return;
-  }
+        const w = resp?.tabs?.weather ?? null;
+        if (!w){
+          content.innerHTML = `<div class="empty">No weather included in this response. Try “Include → All details”.</div>`;
+          return;
+        }
 
-  const d = w.daily ?? {};
-  const h = w.hourly ?? {};
+        const d = w.daily ?? {};
+        const h = w.hourly ?? {};
 
-  // Kelvin -> °F (friendly for US users). If you prefer °C, say so.
-  const KtoF = (K) => {
-    const n = Number(K);
-    if (!Number.isFinite(n)) return null;
-    return Math.round((n - 273.15) * 9/5 + 32);
-  };
+        const KtoF = (K) => {
+          const n = Number(K);
+          if (!Number.isFinite(n)) return null;
+          return Math.round((n - 273.15) * 9/5 + 32);
+        };
 
-  const tMaxF = KtoF(d.origin_temp_max_K);
-  const tMinF = KtoF(d.origin_temp_min_K);
+        const tMaxF = KtoF(d.origin_temp_max_K);
+        const tMinF = KtoF(d.origin_temp_min_K);
 
-  const precipMm = Number(d.origin_daily_precip_sum_mm);
-  const windKmhMax = Number(d.origin_daily_windspeed_max_kmh);
+        const precipMm = Number(d.origin_daily_precip_sum_mm);
+        const windKmhMax = Number(d.origin_daily_windspeed_max_kmh);
 
-  const depTempF = KtoF(h.origin_dep_temp_K);
-  const depPrecipMm = Number(h.origin_dep_precip_mm);
-  const depWindKmh = Number(h.origin_dep_windspeed_kmh);
+        const depTempF = KtoF(h.origin_dep_temp_K);
+        const depPrecipMm = Number(h.origin_dep_precip_mm);
+        const depWindKmh = Number(h.origin_dep_windspeed_kmh);
 
-  const dailyCode = d.origin_daily_weathercode;
-  const hourlyCode = h.origin_dep_hour_weathercode;
+        const dailyCode = d.origin_daily_weathercode;
+        const hourlyCode = h.origin_dep_hour_weathercode;
 
-  const iconDaily = wxIconSvg(wxKindFromCode(dailyCode));
-  const iconHourly = wxIconSvg(wxKindFromCode(hourlyCode));
+        const iconDaily = wxIconSvg(wxKindFromCode(dailyCode));
+        const iconHourly = wxIconSvg(wxKindFromCode(hourlyCode));
 
-  const tline = (tMinF != null && tMaxF != null) ? `${tMinF}°F – ${tMaxF}°F` : "—";
-  const windMaxLine = Number.isFinite(windKmhMax) ? `${Math.round(windKmhMax)} km/h` : "—";
-  const precipLine = Number.isFinite(precipMm) ? `${Math.round(precipMm * 10) / 10} mm` : "—";
+        const tline = (tMinF != null && tMaxF != null) ? `${tMinF}°F – ${tMaxF}°F` : "—";
+        const windMaxLine = Number.isFinite(windKmhMax) ? `${Math.round(windKmhMax)} km/h` : "—";
+        const precipLine = Number.isFinite(precipMm) ? `${Math.round(precipMm * 10) / 10} mm` : "—";
 
-  const depTempLine = (depTempF != null) ? `${depTempF}°F` : "—";
-  const depWindLine = Number.isFinite(depWindKmh) ? `${Math.round(depWindKmh)} km/h` : "—";
-  const depPrecipLine = Number.isFinite(depPrecipMm) ? `${Math.round(depPrecipMm * 10) / 10} mm` : "—";
+        const depTempLine = (depTempF != null) ? `${depTempF}°F` : "—";
+        const depWindLine = Number.isFinite(depWindKmh) ? `${Math.round(depWindKmh)} km/h` : "—";
+        const depPrecipLine = Number.isFinite(depPrecipMm) ? `${Math.round(depPrecipMm * 10) / 10} mm` : "—";
 
-  content.innerHTML = `
-    <div class="twoCol">
-      <div class="miniCard">
-        <div class="wxRow">
-          <div class="wxIcon">${iconDaily}</div>
-          <div class="wxMeta">
-            <p class="big">Daily outlook (origin)</p>
-            <p class="muted">Temp: ${safeText(tline)} · Code: ${safeText(dailyCode ?? "—")}</p>
+        content.innerHTML = `
+          <div class="twoCol">
+            <div class="miniCard">
+              <div class="wxRow">
+                <div class="wxIcon">${iconDaily}</div>
+                <div class="wxMeta">
+                  <p class="big">Daily outlook (origin)</p>
+                  <p class="muted">Temp: ${safeText(tline)} · Code: ${safeText(dailyCode ?? "—")}</p>
+                </div>
+              </div>
+              <div class="footnote">Precip: ${safeText(precipLine)} · Max wind: ${safeText(windMaxLine)}</div>
+            </div>
+
+            <div class="miniCard">
+              <div class="wxRow">
+                <div class="wxIcon">${iconHourly}</div>
+                <div class="wxMeta">
+                  <p class="big">At departure hour (origin)</p>
+                  <p class="muted">Temp: ${safeText(depTempLine)} · Code: ${safeText(hourlyCode ?? "—")}</p>
+                </div>
+              </div>
+              <div class="footnote">Precip: ${safeText(depPrecipLine)} · Wind: ${safeText(depWindLine)}</div>
+            </div>
           </div>
-        </div>
-        <div class="footnote">Precip: ${safeText(precipLine)} · Max wind: ${safeText(windMaxLine)}</div>
-      </div>
 
-      <div class="miniCard">
-        <div class="wxRow">
-          <div class="wxIcon">${iconHourly}</div>
-          <div class="wxMeta">
-            <p class="big">At departure hour (origin)</p>
-            <p class="muted">Temp: ${safeText(depTempLine)} · Code: ${safeText(hourlyCode ?? "—")}</p>
-          </div>
-        </div>
-        <div class="footnote">Precip: ${safeText(depPrecipLine)} · Wind: ${safeText(depWindLine)}</div>
-      </div>
-    </div>
-
-    <div class="sectionTitle">How to read this</div>
-    <div class="miniCard">
-      <div class="small">
-        Icons summarize the weather codes. If you see rain/storm near departure, risk often increases.
-      </div>
-    </div>
-  `;
-}
-
-function renderFlightHistory(resp){
-  const fh = resp?.tabs?.flight_history ?? null;
-  if (!fh){
-    content.innerHTML = `<div class="empty">No flight-number history included. Try “Include → All details”.</div>`;
-    return;
-  }
-
-  const support28 = fh.flightnum_od_support_count_last28d;
-  const lowSupport28 = fh.flightnum_od_low_support_last28d;
-
-  const m7  = roundMinutes(fh.flightnum_od_depdelay_mean_last7);
-  const m14 = roundMinutes(fh.flightnum_od_depdelay_mean_last14);
-  const m21 = roundMinutes(fh.flightnum_od_depdelay_mean_last21);
-  const m28 = roundMinutes(fh.flightnum_od_depdelay_mean_last28);
-
-  // “Histogram-style”: show bars scaled to the max of these means (visual summary)
-  const vals = [m7, m14, m21, m28].map(v => (v == null ? 0 : v));
-  const maxv = Math.max(1, ...vals);
-
-  const rows = [
-    { label: "Last 7 days",  v: m7 },
-    { label: "Last 14 days", v: m14 },
-    { label: "Last 21 days", v: m21 },
-    { label: "Last 28 days", v: m28 }
-  ];
-
-  content.innerHTML = `
-    <div class="twoCol">
-      <div class="miniCard">
-        <h4>Recent delay history (this flight #, this route)</h4>
-        <div class="small">Average departure delay over rolling windows.</div>
-        <div class="footnote">
-          28-day sample size: <b>${safeText(support28 ?? "—")}</b>
-          ${lowSupport28 ? `· Low-support flag: <b>${safeText(lowSupport28)}</b>` : ""}
-        </div>
-      </div>
-
-      <div class="miniCard">
-        <h4>What to look for</h4>
-        <div class="small">
-          If the recent 7-day average is much higher than 28-day, it may indicate a temporary issue (ops, weather patterns, etc.).
-        </div>
-      </div>
-    </div>
-
-    <div class="sectionTitle">Histogram-style summary</div>
-    <div class="barList">
-      ${rows.map(r => {
-        const v = (r.v == null ? null : r.v);
-        const pct = v == null ? 0 : (v / maxv) * 100;
-        return `
-          <div class="barRow">
-            <div class="barLabel">${safeText(r.label)}</div>
-            <div class="barTrack"><div class="barFill" style="width:${pct.toFixed(2)}%"></div></div>
-            <div class="barVal">${v == null ? "—" : `${v}m`}</div>
+          <div class="sectionTitle">How to read this</div>
+          <div class="miniCard">
+            <div class="small">
+              Icons summarize the weather codes. If you see rain/storm near departure, risk often increases.
+            </div>
           </div>
         `;
-      }).join("")}
-    </div>
+      }
 
-    <div class="footnote">Minutes are rounded to the nearest minute.</div>
-  `;
-}
+      function renderFlightHistory(resp){
+        const fh = resp?.tabs?.flight_history ?? null;
+        if (!fh){
+          content.innerHTML = `<div class="empty">No flight-number history included. Try “Include → All details”.</div>`;
+          return;
+        }
+
+        const support28 = fh.flightnum_od_support_count_last28d;
+        const lowSupport28 = fh.flightnum_od_low_support_last28d;
+
+        const m7  = roundMinutes(fh.flightnum_od_depdelay_mean_last7);
+        const m14 = roundMinutes(fh.flightnum_od_depdelay_mean_last14);
+        const m21 = roundMinutes(fh.flightnum_od_depdelay_mean_last21);
+        const m28 = roundMinutes(fh.flightnum_od_depdelay_mean_last28);
+
+        const vals = [m7, m14, m21, m28].map(v => (v == null ? 0 : v));
+        const maxv = Math.max(1, ...vals);
+
+        const rows = [
+          { label: "Last 7 days",  v: m7 },
+          { label: "Last 14 days", v: m14 },
+          { label: "Last 21 days", v: m21 },
+          { label: "Last 28 days", v: m28 }
+        ];
+
+        content.innerHTML = `
+          <div class="twoCol">
+            <div class="miniCard">
+              <h4>Recent delay history (this flight #, this route)</h4>
+              <div class="small">Average departure delay over rolling windows.</div>
+              <div class="footnote">
+                28-day sample size: <b>${safeText(support28 ?? "—")}</b>
+                ${lowSupport28 ? `· Low-support flag: <b>${safeText(lowSupport28)}</b>` : ""}
+              </div>
+            </div>
+
+            <div class="miniCard">
+              <h4>What to look for</h4>
+              <div class="small">
+                If the recent 7-day average is much higher than 28-day, it may indicate a temporary issue (ops, weather patterns, etc.).
+              </div>
+            </div>
+          </div>
+
+          <div class="sectionTitle">Histogram-style summary</div>
+          <div class="barList">
+            ${rows.map(r => {
+              const v = (r.v == null ? null : r.v);
+              const pct = v == null ? 0 : (v / maxv) * 100;
+              return `
+                <div class="barRow">
+                  <div class="barLabel">${safeText(r.label)}</div>
+                  <div class="barTrack"><div class="barFill" style="width:${pct.toFixed(2)}%"></div></div>
+                  <div class="barVal">${v == null ? "—" : `${v}m`}</div>
+                </div>
+              `;
+            }).join("")}
+          </div>
+
+          <div class="footnote">Minutes are rounded to the nearest minute.</div>
+        `;
+      }
 
       function renderAirport(resp){
-  const a = resp?.tabs?.airport_stats ?? null;
-  if (!a){
-    content.innerHTML = `<div class="empty">No airport stats included. Try “Include → All details”.</div>`;
-    return;
-  }
+        const a = resp?.tabs?.airport_stats ?? null;
+        if (!a){
+          content.innerHTML = `<div class="empty">No airport stats included. Try “Include → All details”.</div>`;
+          return;
+        }
 
-  content.innerHTML = `
-    <div class="miniCard">
-      <h4>Airport stats</h4>
-      <div class="small">
-        Origin airport: <b>${safeText(a.origin ?? "—")}</b>
-      </div>
-      <div class="footnote">
-        Your backend is currently returning only the airport code. Once you add metrics (delay rates, cancellations, etc.),
-        this tab will show them as cards (no JSON).
-      </div>
-    </div>
-  `;
-}
+        content.innerHTML = `
+          <div class="miniCard">
+            <h4>Airport stats</h4>
+            <div class="small">
+              Origin airport: <b>${safeText(a.origin ?? "—")}</b>
+            </div>
+            <div class="footnote">
+              Your backend is currently returning only the airport code. Once you add metrics (delay rates, cancellations, etc.),
+              this tab will show them as cards (no JSON).
+            </div>
+          </div>
+        `;
+      }
 
-function renderAirline(resp){
-  const a = resp?.tabs?.airline_stats ?? null;
-  if (!a){
-    content.innerHTML = `<div class="empty">No airline stats included. Try “Include → All details”.</div>`;
-    return;
-  }
+      function renderAirline(resp){
+        const a = resp?.tabs?.airline_stats ?? null;
+        if (!a){
+          content.innerHTML = `<div class="empty">No airline stats included. Try “Include → All details”.</div>`;
+          return;
+        }
 
-  content.innerHTML = `
-    <div class="miniCard">
-      <h4>Airline stats</h4>
-      <div class="small">
-        Airline: <b>${safeText(a.airline ?? "—")}</b>
-      </div>
-      <div class="footnote">
-        Your backend is currently returning only the airline code. Once you include metrics (del15 rate, avg delay, etc.),
-        we’ll render them as clean cards and charts.
-      </div>
-    </div>
-  `;
-}
+        content.innerHTML = `
+          <div class="miniCard">
+            <h4>Airline stats</h4>
+            <div class="small">
+              Airline: <b>${safeText(a.airline ?? "—")}</b>
+            </div>
+            <div class="footnote">
+              Your backend is currently returning only the airline code. Once you include metrics (del15 rate, avg delay, etc.),
+              we’ll render them as clean cards and charts.
+            </div>
+          </div>
+        `;
+      }
     </script>
   </body>
 </html>

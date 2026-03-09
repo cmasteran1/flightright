@@ -186,15 +186,28 @@ app.post("/api/predict", async (req, res) => {
       data = null;
     }
 
-    const rawMsg = String(data?.detail || data?.error || text || "").trim();
+   const payload =
+  data && typeof data?.detail === "object" && data.detail !== null
+    ? data.detail
+    : data;
 
-    const alreadyHelpful =
-      !!data?.user_title || !!data?.user_message || !!data?.user_action;
+const rawMsg = String(
+  payload?.detail || payload?.error || data?.error || text || ""
+).trim();
 
-    if (alreadyHelpful) {
-      return res.status(r.status).json(data);
-    }
+const alreadyHelpful =
+  !!payload?.user_title ||
+  !!payload?.user_message ||
+  !!payload?.user_action ||
+  !!payload?.error_code ||
+  !!payload?.needs_schedule_inputs;
 
+if (alreadyHelpful) {
+  return res.status(r.status).json({
+  ok: false,
+  ...payload
+});
+}
     const generic =
       !rawMsg ||
       /^bad request\.?$/i.test(rawMsg) ||

@@ -19,6 +19,7 @@ from flightright.cli import predict as cli  # for warm() reuse
 from flightright.service.bootstrap_meta import ensure_meta_files
 from flightright.service.predictor import (
     DataPaths,
+    FlightNeedsScheduleTimesError,
     ModelSpecDefaults,
     RemoteModelConfig,
     ServiceConfig,
@@ -103,6 +104,9 @@ def _public_error_payload(
     user_message: str,
     user_action: str,
     debug_detail: Optional[str] = None,
+    error_code: Optional[str] = None,
+    warning: Optional[str] = None,
+    needs_schedule_inputs: bool = False,
 ) -> Dict[str, Any]:
     payload: Dict[str, Any] = {
         "ok": False,
@@ -111,6 +115,12 @@ def _public_error_payload(
         "user_message": user_message,
         "user_action": user_action,
     }
+    if error_code:
+        payload["error_code"] = error_code
+    if warning:
+        payload["warning"] = warning
+    if needs_schedule_inputs:
+        payload["needs_schedule_inputs"] = True
     if debug_detail and not IS_PROD:
         payload["debug_detail"] = debug_detail
     return payload
@@ -240,6 +250,14 @@ class PredictIn(BaseModel):
     date: date
     origin: str
     dest: str
+    sched_dep_time_24h: Optional[str] = Field(
+        default=None,
+        description="Optional local scheduled departure time in HH:MM 24-hour format. Used only if automatic flight lookup fails.",
+    )
+    sched_arr_time_24h: Optional[str] = Field(
+        default=None,
+        description="Optional local scheduled arrival time in HH:MM 24-hour format. Used only if automatic flight lookup fails.",
+    )
     include: IncludeSpec = IncludeSpec()
 
 
@@ -260,9 +278,11 @@ def _startup_bootstrap_meta() -> None:
     if not bucket:
         raise RuntimeError("Missing FLIGHTRIGHT_META_BUCKET (or FLIGHTRIGHT_S3_BUCKET)")
 
+    meta_root = Path(_env("FLIGHTRIGHT_META_ROOT", str(CFG.data_paths.airports_csv.parent)))
+
     downloads = [
-        ("meta/aircraft_registry_clean.csv", Path("/data/meta/aircraft_registry_clean.csv")),
-        ("meta/airport_rankings/50_group_4_total.txt", Path("/data/meta/airport_rankings/50_group_4_total.txt")),
+        ("meta/aircraft_registry_clean.csv", meta_root / "aircraft_registry_clean.csv"),
+        ("meta/airport_rankings/50_group_4_total.txt", meta_root / "airport_rankings" / "50_group_4_total.txt"),
     ]
     ensure_meta_files(bucket=bucket, downloads=downloads)
 
@@ -302,6 +322,8 @@ def predict(
             dep_date=inp.date,
             origin=inp.origin,
             dest=inp.dest,
+            sched_dep_time_24h=inp.sched_dep_time_24h,
+            sched_arr_time_24h=inp.sched_arr_time_24h,
             cfg=CFG,
             include_weather=inp.include.weather,
             include_flight_history=inp.include.flight_history,
@@ -309,6 +331,26 @@ def predict(
             include_airline_stats=inp.include.airline_stats,
             include_features=False,  # never for public
             public_mode=True,        # prevents model_locator leaks
+        )
+    except FlightNeedsScheduleTimesError as e:
+        raise HTTPException(
+            status_code=422,
+            detail=_public_error_payload(
+                request_id=request_id,
+                error_code="flight_not_found_needs_schedule_times",
+                warning="Flight was not found automatically, but it may still exist.",
+                user_title="We couldn’t confirm that flight automatically",
+                user_message=(
+                    "We could not find this flight in the scheduled feed. "
+                    "It may still exist. Enter the scheduled departure and arrival times to continue."
+                ),
+                user_action=(
+                    "Enter the local scheduled departure and arrival times from your itinerary, "
+                    "then try again."
+                ),
+                needs_schedule_inputs=True,
+                debug_detail=str(e),
+            ),
         )
     except HTTPException:
         raise
@@ -362,6 +404,8 @@ def admin_predict(
             dep_date=inp.date,
             origin=inp.origin,
             dest=inp.dest,
+            sched_dep_time_24h=inp.sched_dep_time_24h,
+            sched_arr_time_24h=inp.sched_arr_time_24h,
             cfg=CFG,
             include_weather=inp.include.weather,
             include_flight_history=inp.include.flight_history,

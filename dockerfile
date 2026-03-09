@@ -14,7 +14,6 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 # deps first (better caching)
 COPY requirements.txt /app/requirements.txt
 RUN pip install --upgrade pip && pip install -r /app/requirements.txt
-RUN python -m playwright install --with-deps chromium
 
 # copy project + install it WITHOUT changing dependency set
 COPY pyproject.toml /app/pyproject.toml
