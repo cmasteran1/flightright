@@ -63,17 +63,15 @@
   },
 
   "feature_balance": {
+  "enabled": true,
+  "thresholds": [15, 30, 45, 60],
+  "pos_frac": 0.50,
+  "seed": 42,
+  "max_rows": 20000,
+  "output_template": "../flightrightdata/data/processed/train_arr_ge{thr}_balanced_WN_50_23-25.parquet",
+  "eval": {
     "enabled": true,
-    "eval": {
-      "enabled": true,
-      "by": "last_days",
-      "last_days": 90,
-      "output_path": "../flightrightdata/data/processed/features_arr_WN_50_23-25_eval_unbalanced.parquet"
-    },
-    "thresholds": [15, 30, 45, 60],
-    "pos_frac": 0.50,
-    "seed": 42,
-    "max_rows": 20000,
-    "output_template": "../flightrightdata/data/processed/train_arr_ge{thr}_balanced_WN_50_23-25.parquet"
+    "last_days": 90
   }
+}
 }

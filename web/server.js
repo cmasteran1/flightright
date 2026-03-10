@@ -10,7 +10,7 @@ const __dirname = path.dirname(__filename);
 
 const PORT = process.env.PORT || 8080;
 
-// This is your API app (Fly) that actually runs the model.
+// This is your API app that actually runs the model.
 const API_BASE = process.env.FLIGHTRIGHT_API_BASE || "https://api.flightrightus.com";
 
 // Public key required for /predict (kept server-side, never sent to browser).
@@ -38,6 +38,27 @@ app.get("/api/health", async (_req, res) => {
     res.status(502).json({
       ok: false,
       error: "Failed to reach API",
+      details: String(e),
+    });
+  }
+});
+
+// Lookup data comes from the backend, which is responsible for
+// downloading/caching metadata from S3/IDrive as needed.
+app.get("/api/lookups", async (_req, res) => {
+  try {
+    const r = await fetch(`${API_BASE}/lookups`, {
+      headers: { Accept: "application/json" },
+    });
+    const txt = await r.text();
+    res
+      .status(r.status)
+      .type(r.headers.get("content-type") || "application/json")
+      .send(txt);
+  } catch (e) {
+    res.status(502).json({
+      ok: false,
+      error: "Failed to reach lookups endpoint",
       details: String(e),
     });
   }
@@ -186,38 +207,27 @@ app.post("/api/predict", async (req, res) => {
       data = null;
     }
 
-   const payload =
-  data && typeof data?.detail === "object" && data.detail !== null
-    ? data.detail
-    : data;
+    const payload =
+      data && typeof data?.detail === "object" && data.detail !== null
+        ? data.detail
+        : data;
 
-const rawMsg = String(
-  payload?.detail || payload?.error || data?.error || text || ""
-).trim();
+    const rawMsg = String(
+      payload?.detail || payload?.error || data?.error || text || ""
+    ).trim();
 
-const alreadyHelpful =
-  !!payload?.user_title ||
-  !!payload?.user_message ||
-  !!payload?.user_action ||
-  !!payload?.error_code ||
-  !!payload?.needs_schedule_inputs;
+    const alreadyHelpful =
+      !!payload?.user_title ||
+      !!payload?.user_message ||
+      !!payload?.user_action ||
+      !!payload?.error_code ||
+      !!payload?.needs_schedule_inputs;
 
-if (alreadyHelpful) {
-  return res.status(r.status).json({
-  ok: false,
-  ...payload
-});
-}
-    const generic =
-      !rawMsg ||
-      /^bad request\.?$/i.test(rawMsg) ||
-      /^request failed/i.test(rawMsg) ||
-      /^internal server error\.?$/i.test(rawMsg);
-
-    if (generic) {
-      return res
-        .status(r.status)
-        .json(buildUserFacingPredictError(r.status, rawMsg));
+    if (alreadyHelpful) {
+      return res.status(r.status).json({
+        ok: false,
+        ...payload,
+      });
     }
 
     return res
@@ -236,7 +246,7 @@ if (alreadyHelpful) {
   }
 });
 
-// SPA fallback (safe even if you add routing later)
+// SPA fallback
 app.get("*", (_req, res) => {
   res.sendFile(path.join(__dirname, "public", "index.html"));
 });

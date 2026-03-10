@@ -174,6 +174,59 @@
         box-shadow: 0 0 0 3px rgba(124,92,255,.18);
       }
 
+      .autocomplete{
+        position:relative;
+      }
+
+      .suggestions{
+        position:absolute;
+        top:calc(100% + 6px);
+        left:0;
+        right:0;
+        z-index:40;
+        display:none;
+        max-height:260px;
+        overflow:auto;
+        border:1px solid rgba(255,255,255,.14);
+        border-radius:16px;
+        background: rgba(8, 12, 28, .96);
+        box-shadow: 0 18px 40px rgba(0,0,0,.45);
+        backdrop-filter: blur(12px);
+      }
+
+      .suggestions.open{
+        display:block;
+      }
+
+      .suggestionItem{
+        padding: 11px 12px;
+        cursor:pointer;
+        border-bottom: 1px solid rgba(255,255,255,.06);
+      }
+
+      .suggestionItem:last-child{
+        border-bottom:none;
+      }
+
+      .suggestionItem:hover,
+      .suggestionItem.active{
+        background: rgba(124,92,255,.18);
+      }
+
+      .suggestionTop{
+        font-size: 14px;
+        font-weight: 700;
+        color: var(--text);
+        line-height: 1.2;
+      }
+
+      .suggestionSub{
+        margin-top: 3px;
+        font-size: 12px;
+        color: var(--muted);
+        line-height: 1.25;
+      }
+
       .btn{
         margin-top: 14px;
         width: 100%;
@@ -438,8 +491,11 @@
           <div class="panel">
             <div class="formGrid">
               <div>
-                <label for="airline">Airline (IATA)</label>
-                <input id="airline" maxlength="3" value="WN" />
+                <label for="airline">Airline</label>
+                <div class="autocomplete">
+                  <input id="airline" maxlength="40" value="WN" placeholder="WN or Southwest Airlines" autocomplete="off" />
+                  <div id="airlineSuggestions" class="suggestions"></div>
+                </div>
               </div>
 
               <div>
@@ -462,12 +518,18 @@
 
               <div>
                 <label for="origin">Origin</label>
-                <input id="origin" maxlength="3" value="BWI" />
+                <div class="autocomplete">
+                  <input id="origin" maxlength="80" value="BWI" placeholder="BWI or Baltimore/Washington" autocomplete="off" />
+                  <div id="originSuggestions" class="suggestions"></div>
+                </div>
               </div>
 
               <div>
                 <label for="dest">Destination</label>
-                <input id="dest" maxlength="3" value="CVG" />
+                <div class="autocomplete">
+                  <input id="dest" maxlength="80" value="CVG" placeholder="CVG or Cincinnati" autocomplete="off" />
+                  <div id="destSuggestions" class="suggestions"></div>
+                </div>
               </div>
             </div>
 
@@ -559,6 +621,20 @@
         return String(s ?? "").replace(/[&<>"']/g, (c) => ({
           "&":"&amp;", "<":"&lt;", ">":"&gt;", '"':"&quot;", "'":"&#39;"
         }[c]));
+      }
+
+      function normalizeForLookup(s){
+        return String(s ?? "")
+          .toLowerCase()
+          .replace(/[()\-/,]/g, " ")
+          .replace(/\s+/g, " ")
+          .trim();
+      }
+
+      function extractCodeFromText(value, codeLength){
+        const upper = String(value ?? "").toUpperCase();
+        const direct = upper.match(new RegExp(`\\b([A-Z0-9]{${codeLength}})\\b`));
+        return direct ? direct[1] : null;
       }
 
       function normalizePredictError(status, data, fallbackMessage){
@@ -768,10 +844,11 @@
         const weightMap = {
           "< 15 min": 0.00,
           "15–30 min": 0.25,
-          "30-45 min": 0.50,
+          "15-30 min": 0.25,
           "30–45 min": 0.50,
-          "45-60 min": 0.75,
+          "30-45 min": 0.50,
           "45–60 min": 0.75,
+          "45-60 min": 0.75,
           "≥ 60 min": 1.00,
           ">= 60 min": 1.00
         };
@@ -800,6 +877,217 @@
         return String(x ?? "").trim();
       }
 
+      const lookupState = {
+        loaded: false,
+        airlines: [],
+        airports: {},
+        allowed_airports_by_airline: {},
+        airlineAliasToCode: new Map(),
+        airportAliasToCode: new Map(),
+      };
+
+      function registerAirlineAliases(airline){
+        const candidates = [
+          airline.code,
+          airline.name,
+          `${airline.name} (${airline.code})`,
+          ...(Array.isArray(airline.aliases) ? airline.aliases : []),
+        ];
+
+        for (const c of candidates) {
+          const key = normalizeForLookup(c);
+          if (key) lookupState.airlineAliasToCode.set(key, airline.code);
+        }
+      }
+
+      function registerAirportAliases(ap){
+        const candidates = [
+          ap.code,
+          ap.name,
+          ap.city,
+          `${ap.city}, ${ap.state}`,
+          `${ap.city} (${ap.code})`,
+          `${ap.code} — ${ap.name}`,
+          `${ap.city} (${ap.code}) — ${ap.name}`,
+          ap.display,
+        ];
+
+        for (const c of candidates) {
+          const key = normalizeForLookup(c);
+          if (key) lookupState.airportAliasToCode.set(key, ap.code);
+        }
+      }
+
+      function resolveAirlineCode(value){
+        const raw = String(value ?? "").trim();
+        if (!raw) return "";
+
+        const maybeCode = extractCodeFromText(raw, 2);
+        if (maybeCode && lookupState.airlines.some((a) => a.code === maybeCode)) {
+          return maybeCode;
+        }
+
+        const key = normalizeForLookup(raw);
+        return lookupState.airlineAliasToCode.get(key) || "";
+      }
+
+      function getAllowedAirportsForAirline(airlineCode){
+        const code = String(airlineCode ?? "").toUpperCase();
+        const allowed = lookupState.allowed_airports_by_airline?.[code];
+        if (Array.isArray(allowed) && allowed.length) return allowed;
+        return Object.keys(lookupState.airports || {});
+      }
+
+      function resolveAirportCode(value, airlineCode){
+        const raw = String(value ?? "").trim();
+        if (!raw) return "";
+
+        const allowed = new Set(getAllowedAirportsForAirline(airlineCode));
+
+        const maybeCode = extractCodeFromText(raw, 3);
+        if (maybeCode && allowed.has(maybeCode)) {
+          return maybeCode;
+        }
+
+        const key = normalizeForLookup(raw);
+        const aliasCode = lookupState.airportAliasToCode.get(key);
+        if (aliasCode && allowed.has(aliasCode)) {
+          return aliasCode;
+        }
+
+        const plain = normalizeIata(raw);
+        if (allowed.has(plain)) {
+          return plain;
+        }
+
+        return "";
+      }
+
+      function getAirlineMatches(query){
+        const q = normalizeForLookup(query);
+        const rows = lookupState.airlines.map((a) => ({
+          code: a.code,
+          title: `${a.code} — ${a.name}`,
+          subtitle: Array.isArray(a.aliases) ? a.aliases.join(" · ") : "",
+          searchText: normalizeForLookup([a.code, a.name, ...(a.aliases || [])].join(" ")),
+        }));
+
+        if (!q) return rows.slice(0, 8);
+
+        return rows
+          .filter((r) => r.searchText.includes(q))
+          .slice(0, 8);
+      }
+
+      function getAirportMatches(query, airlineCode){
+        const q = normalizeForLookup(query);
+        const allowed = getAllowedAirportsForAirline(airlineCode);
+
+        const rows = allowed
+          .map((code) => lookupState.airports?.[code])
+          .filter(Boolean)
+          .map((ap) => ({
+            code: ap.code,
+            title: `${ap.code} — ${ap.city || ap.name || ap.code}`,
+            subtitle: ap.name && ap.city ? ap.name : (ap.state ? `${ap.city}, ${ap.state}` : ap.name),
+            searchText: normalizeForLookup([
+              ap.code,
+              ap.name,
+              ap.city,
+              ap.state,
+              ap.display
+            ].join(" "))
+          }));
+
+        if (!q) return rows.slice(0, 10);
+
+        return rows
+          .filter((r) => r.searchText.includes(q))
+          .slice(0, 10);
+      }
+
+      let activeMenu = null;
+
+      function closeAllSuggestionMenus(){
+        document.querySelectorAll(".suggestions").forEach((el) => {
+          el.classList.remove("open");
+          el.innerHTML = "";
+        });
+        activeMenu = null;
+      }
+
+      function renderSuggestionMenu(menuEl, items, onSelect){
+        menuEl.innerHTML = "";
+
+        if (!items.length) {
+          menuEl.classList.remove("open");
+          if (activeMenu === menuEl) activeMenu = null;
+          return;
+        }
+
+        items.forEach((item, idx) => {
+          const row = document.createElement("div");
+          row.className = "suggestionItem";
+          if (idx === 0) row.classList.add("active");
+          row.dataset.code = item.code || "";
+          row.innerHTML = `
+            <div class="suggestionTop">${safeText(item.title)}</div>
+            <div class="suggestionSub">${safeText(item.subtitle || "")}</div>
+          `;
+          row.addEventListener("mousedown", (e) => {
+            e.preventDefault();
+            onSelect(item);
+            closeAllSuggestionMenus();
+          });
+          menuEl.appendChild(row);
+        });
+
+        menuEl.classList.add("open");
+        activeMenu = menuEl;
+      }
+
+      function moveActiveSuggestion(menuEl, delta){
+        const items = Array.from(menuEl.querySelectorAll(".suggestionItem"));
+        if (!items.length) return;
+
+        let idx = items.findIndex((el) => el.classList.contains("active"));
+        if (idx < 0) idx = 0;
+
+        items[idx].classList.remove("active");
+        idx = (idx + delta + items.length) % items.length;
+        items[idx].classList.add("active");
+        items[idx].scrollIntoView({ block: "nearest" });
+      }
+
+      function selectActiveSuggestion(menuEl){
+        const active = menuEl.querySelector(".suggestionItem.active");
+        if (active) {
+          active.dispatchEvent(new MouseEvent("mousedown", { bubbles: true }));
+        }
+      }
+
+      async function loadLookups(){
+        try {
+          const r = await fetch("/api/lookups", { cache: "no-store" });
+          if (!r.ok) return;
+          const data = await r.json();
+          if (!data?.ok) return;
+
+          lookupState.loaded = true;
+          lookupState.airlines = Array.isArray(data.airlines) ? data.airlines : [];
+          lookupState.airports = data.airports || {};
+          lookupState.allowed_airports_by_airline = data.allowed_airports_by_airline || {};
+
+          lookupState.airlineAliasToCode.clear();
+          lookupState.airportAliasToCode.clear();
+
+          for (const airline of lookupState.airlines) registerAirlineAliases(airline);
+          for (const ap of Object.values(lookupState.airports)) registerAirportAliases(ap);
+        } catch (_e) {
+          // Graceful fallback: user can still enter codes manually.
+        }
+      }
+
       // ---------- state ----------
       const state = {
         activeTab: "prediction",
@@ -822,6 +1110,10 @@
       const destEl = document.getElementById("dest");
       const includeEl = document.getElementById("include");
       const goBtn = document.getElementById("goBtn");
+
+      const airlineSuggestionsEl = document.getElementById("airlineSuggestions");
+      const originSuggestionsEl = document.getElementById("originSuggestions");
+      const destSuggestionsEl = document.getElementById("destSuggestions");
 
       const scheduleFallbackBoxEl = document.getElementById("scheduleFallbackBox");
       const scheduleFallbackWarningEl = document.getElementById("scheduleFallbackWarning");
@@ -847,8 +1139,110 @@
           "Warning: this flight was not found automatically, but it may still exist. Enter the scheduled local departure and arrival times from your itinerary to continue.";
       }
 
+      function showAirlineSuggestions(){
+        if (!lookupState.loaded) return;
+        const matches = getAirlineMatches(airlineEl.value);
+        renderSuggestionMenu(airlineSuggestionsEl, matches, (item) => {
+          airlineEl.value = item.code;
+          const code = item.code;
+          const originCode = resolveAirportCode(originEl.value, code);
+          const destCode = resolveAirportCode(destEl.value, code);
+          if (originCode) originEl.value = originCode;
+          if (destCode) destEl.value = destCode;
+        });
+      }
+
+      function showOriginSuggestions(){
+        if (!lookupState.loaded) return;
+        const airlineCode = resolveAirlineCode(airlineEl.value);
+        const matches = getAirportMatches(originEl.value, airlineCode);
+        renderSuggestionMenu(originSuggestionsEl, matches, (item) => {
+          originEl.value = item.code;
+        });
+      }
+
+      function showDestSuggestions(){
+        if (!lookupState.loaded) return;
+        const airlineCode = resolveAirlineCode(airlineEl.value);
+        const matches = getAirportMatches(destEl.value, airlineCode);
+        renderSuggestionMenu(destSuggestionsEl, matches, (item) => {
+          destEl.value = item.code;
+        });
+      }
+
+      function wireAutocomplete(inputEl, menuEl, showFn, resolveFn){
+        inputEl.addEventListener("focus", () => {
+          showFn();
+        });
+
+        inputEl.addEventListener("input", () => {
+          showFn();
+        });
+
+        inputEl.addEventListener("keydown", (e) => {
+          if (!menuEl.classList.contains("open")) {
+            if (e.key === "ArrowDown") {
+              showFn();
+              e.preventDefault();
+            }
+            return;
+          }
+
+          if (e.key === "ArrowDown") {
+            moveActiveSuggestion(menuEl, 1);
+            e.preventDefault();
+          } else if (e.key === "ArrowUp") {
+            moveActiveSuggestion(menuEl, -1);
+            e.preventDefault();
+          } else if (e.key === "Enter") {
+            selectActiveSuggestion(menuEl);
+            e.preventDefault();
+          } else if (e.key === "Escape") {
+            closeAllSuggestionMenus();
+            e.preventDefault();
+          }
+        });
+
+        inputEl.addEventListener("blur", () => {
+          setTimeout(() => {
+            if (resolveFn) {
+              const resolved = resolveFn(inputEl.value);
+              if (resolved) inputEl.value = resolved;
+            }
+            if (activeMenu === menuEl) closeAllSuggestionMenus();
+          }, 120);
+        });
+      }
+
       // default date = tomorrow
       dateEl.value = addDaysISO(1);
+
+      wireAutocomplete(
+        airlineEl,
+        airlineSuggestionsEl,
+        showAirlineSuggestions,
+        (value) => resolveAirlineCode(value)
+      );
+
+      wireAutocomplete(
+        originEl,
+        originSuggestionsEl,
+        showOriginSuggestions,
+        (value) => resolveAirportCode(value, resolveAirlineCode(airlineEl.value))
+      );
+
+      wireAutocomplete(
+        destEl,
+        destSuggestionsEl,
+        showDestSuggestions,
+        (value) => resolveAirportCode(value, resolveAirlineCode(airlineEl.value))
+      );
+
+      document.addEventListener("mousedown", (e) => {
+        if (!e.target.closest(".autocomplete")) {
+          closeAllSuggestionMenus();
+        }
+      });
 
       // Tabs
       document.querySelectorAll(".tab").forEach(tab => {
@@ -880,20 +1274,31 @@
       }
       refreshApiStatus();
       setInterval(refreshApiStatus, 15000);
+      loadLookups();
 
       // ---------- request ----------
       function buildPayload(){
-        const airline = normalizeIata(airlineEl.value);
+        const airline = lookupState.loaded ? resolveAirlineCode(airlineEl.value) : normalizeIata(airlineEl.value);
         const flightnum = normalizeFlightnum(flightnumEl.value);
         const date = dateEl.value;
-        const origin = normalizeIata(originEl.value);
-        const dest = normalizeIata(destEl.value);
+        const origin = lookupState.loaded
+          ? resolveAirportCode(originEl.value, airline)
+          : normalizeIata(originEl.value);
+        const dest = lookupState.loaded
+          ? resolveAirportCode(destEl.value, airline)
+          : normalizeIata(destEl.value);
 
-        if (!airline || airline.length < 2) return { error: "Airline code looks invalid." };
+        if (!airline || airline.length !== 2) {
+          return { error: "Please choose a valid airline. Current supported airlines are WN, UA, DL, and AA." };
+        }
         if (!flightnum) return { error: "Flight number is required." };
         if (!date) return { error: "Date is required." };
-        if (!origin || origin.length !== 3) return { error: "Origin must be a 3-letter IATA code." };
-        if (!dest || dest.length !== 3) return { error: "Destination must be a 3-letter IATA code." };
+        if (!origin || origin.length !== 3) {
+          return { error: "Please choose a valid origin airport for the selected airline." };
+        }
+        if (!dest || dest.length !== 3) {
+          return { error: "Please choose a valid destination airport for the selected airline." };
+        }
 
         const sched_dep_time_24h = String(schedDepTimeEl.value || "").trim();
         const sched_arr_time_24h = String(schedArrTimeEl.value || "").trim();
@@ -928,6 +1333,10 @@
 
         if (sched_dep_time_24h) payload.sched_dep_time_24h = sched_dep_time_24h;
         if (sched_arr_time_24h) payload.sched_arr_time_24h = sched_arr_time_24h;
+
+        airlineEl.value = airline;
+        originEl.value = origin;
+        destEl.value = dest;
 
         return payload;
       }

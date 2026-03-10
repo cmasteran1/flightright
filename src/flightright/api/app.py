@@ -3,6 +3,7 @@ from __future__ import annotations
 import logging
 import os
 import shutil
+import csv
 import time
 import traceback
 import uuid
@@ -280,13 +281,113 @@ def _startup_bootstrap_meta() -> None:
 
     meta_root = Path(_env("FLIGHTRIGHT_META_ROOT", str(CFG.data_paths.airports_csv.parent)))
 
+    meta_root = Path(_env("FLIGHTRIGHT_META_ROOT", str(CFG.data_paths.airports_csv.parent)))
+
     downloads = [
+        ("meta/airports.csv", meta_root / "airports.csv"),
         ("meta/aircraft_registry_clean.csv", meta_root / "aircraft_registry_clean.csv"),
         ("meta/airport_rankings/50_group_4_total.txt", meta_root / "airport_rankings" / "50_group_4_total.txt"),
+        ("meta/airport_rankings/AA_top_50.csv", meta_root / "airport_rankings" / "AA_top_50.csv"),
+        ("meta/airport_rankings/DL_top_50.csv", meta_root / "airport_rankings" / "DL_top_50.csv"),
+        ("meta/airport_rankings/WN_top_50.csv", meta_root / "airport_rankings" / "WN_top_50.csv"),
+        ("meta/airport_rankings/UA_top_50.csv", meta_root / "airport_rankings" / "UA_top_50.csv"),
     ]
     ensure_meta_files(bucket=bucket, downloads=downloads)
 
+SUPPORTED_AIRLINES = [
+    {"code": "WN", "name": "Southwest Airlines", "aliases": ["Southwest", "Southwest Airlines"]},
+    {"code": "UA", "name": "United Airlines", "aliases": ["United", "United Airlines"]},
+    {"code": "DL", "name": "Delta Air Lines", "aliases": ["Delta", "Delta Air Lines", "Delta Airlines"]},
+    {"code": "AA", "name": "American Airlines", "aliases": ["American", "American Airlines"]},
+]
 
+
+def _meta_root() -> Path:
+    return Path(_env("FLIGHTRIGHT_META_ROOT", str(CFG.data_paths.airports_csv.parent)))
+
+
+def _airport_rankings_dir() -> Path:
+    return _meta_root() / "airport_rankings"
+
+
+def _load_airports_lookup() -> Dict[str, Dict[str, Any]]:
+    airports_csv = Path(CFG.data_paths.airports_csv)
+    if not airports_csv.exists():
+        raise RuntimeError(f"airports.csv not found at: {airports_csv}")
+
+    airports: Dict[str, Dict[str, Any]] = {}
+    with airports_csv.open("r", encoding="utf-8", newline="") as f:
+        reader = csv.DictReader(f)
+        for row in reader:
+            code = str(row.get("IATA") or "").strip().upper()
+            if not code:
+                continue
+
+            name = str(row.get("AirportName") or "").strip()
+            city = str(row.get("City") or "").strip()
+            state = str(row.get("State") or "").strip()
+            timezone_name = str(row.get("Timezone") or "").strip()
+
+            display_left = code
+            display_right = city or name or code
+            display = f"{display_left} — {display_right}"
+
+            airports[code] = {
+                "code": code,
+                "name": name,
+                "city": city,
+                "state": state,
+                "timezone": timezone_name,
+                "display": display,
+            }
+
+    return airports
+
+
+def _load_top50_codes(airline_code: str) -> list[str]:
+    path = _airport_rankings_dir() / f"{airline_code.upper()}_top_50.csv"
+    if not path.exists():
+        return []
+
+    text = path.read_text(encoding="utf-8").strip()
+    if not text:
+        return []
+
+    row = next(csv.reader([text]))
+    out = []
+    seen = set()
+    for token in row:
+        code = str(token).strip().upper()
+        if code and code not in seen:
+            seen.add(code)
+            out.append(code)
+    return out
+
+
+def _build_lookup_payload() -> Dict[str, Any]:
+    airports_all = _load_airports_lookup()
+
+    allowed_airports_by_airline: Dict[str, list[str]] = {}
+    airport_union: set[str] = set()
+
+    for airline in SUPPORTED_AIRLINES:
+        code = airline["code"]
+        allowed = _load_top50_codes(code)
+        allowed_airports_by_airline[code] = allowed
+        airport_union.update(allowed)
+
+    airports = {
+        code: airports_all[code]
+        for code in sorted(airport_union)
+        if code in airports_all
+    }
+
+    return {
+        "ok": True,
+        "airlines": SUPPORTED_AIRLINES,
+        "airports": airports,
+        "allowed_airports_by_airline": allowed_airports_by_airline,
+    }
 # -------------------------
 # Routers
 # - public: no auth
@@ -294,7 +395,9 @@ def _startup_bootstrap_meta() -> None:
 # -------------------------
 public = APIRouter()
 protected = APIRouter(dependencies=[Depends(require_api_key)])
-
+@public.get("/lookups")
+def lookups() -> Dict[str, Any]:
+    return _build_lookup_payload()
 
 @public.get("/")
 def root() -> Dict[str, Any]:
