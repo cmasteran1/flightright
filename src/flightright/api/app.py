@@ -209,8 +209,8 @@ class Bucket:
 
 
 RATE_STATE: Dict[str, Bucket] = {}
-RATE_PER_MIN = float(_env("FLIGHTRIGHT_RPM", "6"))  # 6 / min
-BURST = float(_env("FLIGHTRIGHT_BURST", "3"))  # allow short bursts
+RATE_PER_MIN = float(_env("FLIGHTRIGHT_RPM", "30"))  # 30 / min
+BURST = float(_env("FLIGHTRIGHT_BURST", "8"))  # allow short bursts
 
 
 def _take_token(key: str) -> None:
