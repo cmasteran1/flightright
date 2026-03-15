@@ -1703,23 +1703,89 @@ function renderFlightHistory(resp){
   `;
 }
 
+function fmtDelayMinutes(v){
+  if (v === null || v === undefined || v === "") return "—";
+  const n = Number(v);
+  if (!Number.isFinite(n)) return "—";
+  return `${Math.round(n)}m`;
+}
+
+function fmtCount(v){
+  if (v === null || v === undefined || v === "") return "—";
+  const n = Number(v);
+  if (!Number.isFinite(n)) return "—";
+  return String(Math.round(n));
+}
+
+function renderRollupCard(title, stats){
+  if (!stats) {
+    return `
+      <div class="wxCard">
+        <div class="wxTop">
+          <div class="wxDay">${safeText(title)}</div>
+        </div>
+        <div class="small muted">No data available.</div>
+      </div>
+    `;
+  }
+
+  return `
+    <div class="wxCard">
+      <div class="wxTop">
+        <div class="wxDay">${safeText(title)}</div>
+        <div class="wxMeta">${safeText(stats.code ?? "—")}</div>
+      </div>
+
+      <div class="small muted" style="margin-bottom:10px;">Departure delay</div>
+      <div class="kvGrid">
+        <div class="kv"><span>1d mean</span><strong>${fmtDelayMinutes(stats.dep_delay_1d_mean)}</strong></div>
+        <div class="kv"><span>1d median</span><strong>${fmtDelayMinutes(stats.dep_delay_1d_median)}</strong></div>
+        <div class="kv"><span>1d n</span><strong>${fmtCount(stats.n_1d)}</strong></div>
+
+        <div class="kv"><span>7d mean</span><strong>${fmtDelayMinutes(stats.dep_delay_7d_mean)}</strong></div>
+        <div class="kv"><span>7d median</span><strong>${fmtDelayMinutes(stats.dep_delay_7d_median)}</strong></div>
+        <div class="kv"><span>7d n</span><strong>${fmtCount(stats.n_7d)}</strong></div>
+
+        <div class="kv"><span>14d mean</span><strong>${fmtDelayMinutes(stats.dep_delay_14d_mean)}</strong></div>
+        <div class="kv"><span>14d median</span><strong>${fmtDelayMinutes(stats.dep_delay_14d_median)}</strong></div>
+        <div class="kv"><span>14d n</span><strong>${fmtCount(stats.n_14d)}</strong></div>
+      </div>
+
+      <div class="small muted" style="margin:14px 0 10px;">Arrival delay</div>
+      <div class="kvGrid">
+        <div class="kv"><span>1d mean</span><strong>${fmtDelayMinutes(stats.arr_delay_1d_mean)}</strong></div>
+        <div class="kv"><span>1d median</span><strong>${fmtDelayMinutes(stats.arr_delay_1d_median)}</strong></div>
+        <div class="kv"><span>1d n</span><strong>${fmtCount(stats.arr_n_1d)}</strong></div>
+
+        <div class="kv"><span>7d mean</span><strong>${fmtDelayMinutes(stats.arr_delay_7d_mean)}</strong></div>
+        <div class="kv"><span>7d median</span><strong>${fmtDelayMinutes(stats.arr_delay_7d_median)}</strong></div>
+        <div class="kv"><span>7d n</span><strong>${fmtCount(stats.arr_n_7d)}</strong></div>
+
+        <div class="kv"><span>14d mean</span><strong>${fmtDelayMinutes(stats.arr_delay_14d_mean)}</strong></div>
+        <div class="kv"><span>14d median</span><strong>${fmtDelayMinutes(stats.arr_delay_14d_median)}</strong></div>
+        <div class="kv"><span>14d n</span><strong>${fmtCount(stats.arr_n_14d)}</strong></div>
+      </div>
+    </div>
+  `;
+}
+
 function renderAirport(resp){
   const a = resp?.tabs?.airport_stats ?? null;
   if (!a){
-    content.innerHTML = `<div class="empty">No airport stats included. Try “Include → All details”.</div>`;
+    content.innerHTML = `
+      <div class="empty">No airport stats included. Try “Include → All details”.</div>
+    `;
     return;
   }
 
   content.innerHTML = `
-    <div class="miniCard">
-      <h4>Airport stats</h4>
-      <div class="small">
-        Origin airport: <b>${safeText(a.origin ?? "—")}</b>
-      </div>
-      <div class="footnote">
-        Your backend is currently returning only the airport code. Once you add metrics (delay rates, cancellations, etc.),
-        this tab will show them as cards (no JSON).
-      </div>
+    <div class="sectionTitle">Airport stats</div>
+    <div class="small muted" style="margin-bottom:14px;">
+      As of ${safeText(a.as_of_date ?? "—")}
+    </div>
+    <div class="wxGrid">
+      ${renderRollupCard("Origin airport", a.origin)}
+      ${renderRollupCard("Destination airport", a.dest)}
     </div>
   `;
 }
@@ -1727,20 +1793,19 @@ function renderAirport(resp){
 function renderAirline(resp){
   const a = resp?.tabs?.airline_stats ?? null;
   if (!a){
-    content.innerHTML = `<div class="empty">No airline stats included. Try “Include → All details”.</div>`;
+    content.innerHTML = `
+      <div class="empty">No airline stats included. Try “Include → All details”.</div>
+    `;
     return;
   }
 
   content.innerHTML = `
-    <div class="miniCard">
-      <h4>Airline stats</h4>
-      <div class="small">
-        Airline: <b>${safeText(a.airline ?? "—")}</b>
-      </div>
-      <div class="footnote">
-        Your backend is currently returning only the airline code. Once you include metrics (del15 rate, avg delay, etc.),
-        we’ll render them as clean cards and charts.
-      </div>
+    <div class="sectionTitle">Airline stats</div>
+    <div class="small muted" style="margin-bottom:14px;">
+      As of ${safeText(a.as_of_date ?? "—")}
+    </div>
+    <div class="wxGrid">
+      ${renderRollupCard(`Airline ${a.airline ?? "—"}`, a.stats)}
     </div>
   `;
 }

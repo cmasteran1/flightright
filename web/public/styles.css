@@ -594,6 +594,30 @@ input:focus, select:focus{
   color: rgba(255,255,255,.88);
   margin-bottom:12px;
 }
+.kvGrid{
+  display:grid;
+  grid-template-columns:repeat(auto-fit,minmax(140px,1fr));
+  gap:10px;
+}
+
+.kv{
+  border:1px solid rgba(255,255,255,.10);
+  border-radius:14px;
+  padding:12px 14px;
+  background:rgba(255,255,255,.03);
+}
+
+.kv span{
+  display:block;
+  font-size:.82rem;
+  color:rgba(255,255,255,.70);
+  margin-bottom:6px;
+}
+
+.kv strong{
+  font-size:1.05rem;
+  color:#fff;
+}
 
 @media (max-width: 980px){
   .grid{ grid-template-columns: 1fr; }

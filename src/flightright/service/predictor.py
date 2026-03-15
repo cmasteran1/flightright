@@ -11,7 +11,7 @@ from typing import Any, Dict, Optional, Tuple
 from zoneinfo import ZoneInfo
 
 from flightright.cli import predict as cli
-
+from flightright.service.rollups import get_airline_stats, get_airport_stats
 
 @dataclass(frozen=True)
 class RemoteModelConfig:
@@ -432,6 +432,22 @@ def predict_departure(
         histflag=histflag,
     )
 
+    airport_stats = None
+    airline_stats = None
+
+    if include_airport_stats:
+        airport_stats = get_airport_stats(
+            origin=req.origin.upper(),
+            dest=req.dest.upper(),
+            flight_date=req.flight_date,
+        )
+
+    if include_airline_stats:
+        airline_stats = get_airline_stats(
+            airline_iata=req.airline_iata.upper(),
+            flight_date=req.flight_date,
+        )
+
     out: Dict[str, Any] = {
         "ok": True,
         "chosen_model_family": model_family,
@@ -465,8 +481,8 @@ def predict_departure(
         "tabs": {
             "weather": {"daily": daily_w, "hourly": hourly_w} if include_weather else None,
             "flight_history": flight_hist if include_flight_history else None,
-            "airport_stats": {"origin": req.origin.upper()} if include_airport_stats else None,
-            "airline_stats": {"airline": req.airline_iata.upper()} if include_airline_stats else None,
+            "airport_stats": airport_stats,
+            "airline_stats": airline_stats,
         },
     }
 
